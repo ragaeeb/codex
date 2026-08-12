@@ -183,3 +183,17 @@ pub fn approx_tokens_from_byte_count_i64(bytes: i64) -> i64 {
 
 #[cfg(test)]
 mod truncate_tests;
+
+mod output_artifacts;
+pub use output_artifacts::MAX_ARTIFACT_READ_BYTES;
+pub use output_artifacts::MAX_OUTPUT_ARTIFACT_BYTES;
+pub use output_artifacts::OUTPUT_ARTIFACT_RETENTION;
+pub use output_artifacts::OutputArtifactId;
+pub use output_artifacts::OutputArtifactStore;
+pub use output_artifacts::OutputArtifactSweepReport;
+pub use output_artifacts::StoredOutputArtifact;
+pub use output_artifacts::content_type;
+
+#[cfg(test)]
+#[path = "output_artifacts_tests.rs"]
+mod output_artifacts_tests;

@@ -2,6 +2,7 @@ use super::*;
 use anyhow::Context;
 use anyhow::Result;
 use tempfile::tempdir;
+use tokio::fs;
 
 #[test]
 fn hook_output_spiller_is_scoped_to_its_thread() {

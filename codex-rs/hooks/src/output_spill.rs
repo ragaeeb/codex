@@ -1,12 +1,11 @@
 use codex_protocol::ThreadId;
 use codex_protocol::items::HookPromptFragment;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_output_truncation::OutputArtifactStore;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text;
-use tokio::fs;
 use tracing::warn;
-use uuid::Uuid;
 
 const HOOK_OUTPUTS_DIR: &str = "hook_outputs";
 pub(crate) const DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT: usize = 2_500;
@@ -71,23 +70,18 @@ impl HookOutputSpiller {
             return text;
         }
 
-        let path = self.output_dir.join(format!("{}.txt", Uuid::new_v4()));
-        if let Some(parent) = path.parent()
-            && let Err(err) = fs::create_dir_all(parent.as_ref()).await
+        match OutputArtifactStore::new(self.output_dir.clone())
+            .store_text(&text)
+            .await
         {
-            warn!(
-                "failed to create hook output directory {}: {err}",
-                parent.display()
-            );
-            return formatted_truncate_text(&text, TruncationPolicy::Tokens(token_limit));
+            Ok(artifact) => {
+                spilled_hook_output_preview(&text, &artifact.diagnostic_path, token_limit)
+            }
+            Err(err) => {
+                warn!(error_kind = ?err.kind(), "failed to spill hook output");
+                formatted_truncate_text(&text, TruncationPolicy::Tokens(token_limit))
+            }
         }
-
-        if let Err(err) = fs::write(path.as_ref(), &text).await {
-            warn!("failed to write hook output {}: {err}", path.display());
-            return formatted_truncate_text(&text, TruncationPolicy::Tokens(token_limit));
-        }
-
-        spilled_hook_output_preview(&text, &path, token_limit)
     }
 
     pub(crate) async fn maybe_spill_additional_contexts(

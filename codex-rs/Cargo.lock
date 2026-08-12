@@ -3411,7 +3411,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -4350,6 +4349,7 @@ dependencies = [
  "codex-rollout",
  "codex-state",
  "codex-utils-absolute-path",
+ "codex-utils-output-truncation",
  "codex-utils-path",
  "codex-utils-path-uri",
  "futures",
@@ -4636,8 +4636,14 @@ name = "codex-utils-output-truncation"
 version = "0.0.0"
 dependencies = [
  "codex-protocol",
+ "codex-utils-absolute-path",
  "codex-utils-string",
+ "fslock",
  "pretty_assertions",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
