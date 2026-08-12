@@ -41,13 +41,46 @@ pub struct ResponseItemEnvelope {
     pub metadata: Option<CodexHarnessMetadata>,
 }
 
-/// Metadata owned by the Codex harness and persisted with a response item.
+/// Maximum serialized text carried by a store-backed tool-output control item.
 ///
+/// This is intentionally independent of a model's normal tool-output policy:
+/// the fixed metadata needed to recover an artifact can be larger than a very
+/// small configured output limit, but must still have a hard context ceiling.
+pub const STORE_BACKED_TOOL_OUTPUT_MAX_BYTES: usize = 32 * 1024;
+
+/// Metadata owned by the Codex harness and persisted with a response item.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct CodexHarnessMetadata {
     /// Whether a developer message was supplied by an app-server client.
     #[serde(default)]
     pub client_authored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_output_provenance: Option<ToolOutputProvenance>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ToolOutputProvenance {
+    StoreBackedArtifactV1,
+}
+
+impl CodexHarnessMetadata {
+    /// Marks a bounded tool-output control document whose artifact was verified
+    /// in the managed store by the harness.
+    pub fn store_backed_tool_output() -> Self {
+        Self {
+            client_authored: false,
+            tool_output_provenance: Some(ToolOutputProvenance::StoreBackedArtifactV1),
+        }
+    }
+
+    /// Returns whether this response item is a verified store-backed control document.
+    pub fn is_store_backed_tool_output(&self) -> bool {
+        matches!(
+            self.tool_output_provenance,
+            Some(ToolOutputProvenance::StoreBackedArtifactV1)
+        )
+    }
 }
 
 impl ResponseItemEnvelope {

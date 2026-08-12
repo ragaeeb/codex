@@ -7,6 +7,19 @@ use serde_json::Value as JsonValue;
 
 use crate::ToolPayload;
 
+const TELEMETRY_PREVIEW_MAX_BYTES: usize = 2 * 1024;
+const TELEMETRY_PREVIEW_MAX_LINES: usize = 64;
+const TELEMETRY_PREVIEW_TRUNCATION_NOTICE: &str = "[... telemetry preview truncated ...]";
+
+/// Harness-owned provenance carried beside model-facing tool output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolOutputProvenance {
+    /// Tool output is untrusted and must pass through the normal projection policy.
+    #[default]
+    Untrusted,
+    /// Output was produced by the bounded managed-artifact retrieval handler.
+    ManagedArtifactRetrieval,
+}
 /// Model-facing output contract returned by executable tool runtimes.
 pub trait ToolOutput: Send {
     /// Returns a deliberately lossy diagnostic representation, before telemetry size limits.
@@ -21,6 +34,11 @@ pub trait ToolOutput: Send {
     /// `memories.disable_on_external_context` is enabled.
     fn contains_external_context(&self) -> bool {
         false
+    }
+
+    /// Returns trusted harness provenance that must travel out-of-band from model-visible bytes.
+    fn provenance(&self) -> ToolOutputProvenance {
+        ToolOutputProvenance::Untrusted
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
@@ -65,6 +83,10 @@ where
 
     fn contains_external_context(&self) -> bool {
         (**self).contains_external_context()
+    }
+
+    fn provenance(&self) -> ToolOutputProvenance {
+        (**self).provenance()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
