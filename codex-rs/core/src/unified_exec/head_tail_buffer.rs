@@ -12,11 +12,23 @@ pub(crate) struct HeadTailBuffer<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MA
     head: Vec<u8>,
     tail: VecDeque<u8>,
     omitted_bytes: usize,
+    capture_limit: Option<usize>,
+    complete: Option<Vec<u8>>,
+    capture_limit_exceeded: bool,
 }
 
 impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
     const HEAD_BUDGET: usize = MAX_BYTES / 2;
     const TAIL_BUDGET: usize = MAX_BYTES.saturating_sub(Self::HEAD_BUDGET);
+
+    /// Create a preview buffer with a bounded, opt-in complete capture.
+    pub(crate) fn new_recoverable(capture_bytes: usize) -> Self {
+        Self {
+            capture_limit: Some(capture_bytes),
+            complete: Some(Vec::with_capacity(capture_bytes.min(MAX_BYTES))),
+            ..Self::default()
+        }
+    }
 
     // Used for tests.
     #[allow(dead_code)]
@@ -37,14 +49,44 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
         self.retained_bytes().saturating_add(self.omitted_bytes)
     }
 
+    pub(crate) fn capture_limit_exceeded(&self) -> bool {
+        self.capture_limit_exceeded
+    }
+
     /// Append a chunk of bytes to the buffer.
     ///
     /// Bytes are first added to the head until the head budget is full; any
     /// remaining bytes are added to the tail, with older tail bytes being
     /// dropped to preserve the tail budget.
-    pub(crate) fn push_chunk(&mut self, chunk: &[u8]) {
+    pub(crate) fn push_chunk<B: AsRef<[u8]>>(&mut self, chunk: B) {
+        let chunk = chunk.as_ref();
+        if chunk.is_empty() {
+            return;
+        }
+        if let Some(limit) = self.capture_limit
+            && let Some(complete) = self.complete.as_mut()
+        {
+            if complete.len().saturating_add(chunk.len()) <= limit {
+                complete.extend_from_slice(chunk);
+            } else {
+                self.complete = None;
+                self.capture_limit_exceeded = true;
+            }
+        }
         let chunk = self.fill_head(chunk);
         self.push_tail(chunk);
+    }
+
+    /// Snapshot the retained output as head and tail chunks.
+    pub(crate) fn snapshot_chunks(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(2);
+        if !self.head.is_empty() {
+            out.push(self.head.clone());
+        }
+        if !self.tail.is_empty() {
+            out.push(self.tail.iter().copied().collect());
+        }
+        out
     }
 
     /// Fill the stable prefix and return the bytes that did not fit.
@@ -126,10 +168,30 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
     /// Append a later buffer with the same budget. This preserves the summary
     /// of the original concatenated output, including its omission count.
     pub(crate) fn push_buffer(&mut self, buffer: Self) {
+        let captured = match (
+            self.capture_limit,
+            &mut self.complete,
+            buffer.complete.as_ref(),
+        ) {
+            (Some(limit), Some(destination), Some(source))
+                if destination.len().saturating_add(source.len()) <= limit =>
+            {
+                destination.extend_from_slice(source);
+                true
+            }
+            _ => false,
+        };
+        if self.capture_limit.is_some() && !captured {
+            self.complete = None;
+            self.capture_limit_exceeded = true;
+        }
+        self.capture_limit_exceeded |= buffer.capture_limit_exceeded;
+
         let Self {
             head,
             tail,
             omitted_bytes,
+            ..
         } = buffer;
 
         self.omitted_bytes = self.omitted_bytes.saturating_add(omitted_bytes);
@@ -161,6 +223,25 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
                 self.push_tail(second);
             }
         }
+    }
+
+    /// Drain the retained output and capture metadata while preserving the configured limits.
+    pub(crate) fn drain(&mut self) -> Self {
+        Self {
+            head: std::mem::take(&mut self.head),
+            tail: std::mem::take(&mut self.tail),
+            omitted_bytes: std::mem::take(&mut self.omitted_bytes),
+            capture_limit: self.capture_limit,
+            complete: self
+                .capture_limit
+                .map(|_| Vec::new())
+                .and_then(|next| self.complete.replace(next)),
+            capture_limit_exceeded: std::mem::take(&mut self.capture_limit_exceeded),
+        }
+    }
+
+    pub(crate) fn take_complete_bytes(&mut self) -> Option<Vec<u8>> {
+        self.complete.take()
     }
 }
 

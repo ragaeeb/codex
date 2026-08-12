@@ -2,7 +2,6 @@ use rand::Rng;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -570,7 +569,7 @@ impl UnifiedExecProcessManager {
         // (via start_streaming_output above) and collect a snapshot here for
         // the tool response body.
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected_output = Self::collect_output_until_deadline(
+        let mut collected_output = Self::collect_output_until_deadline(
             process.output_handles(),
             Some(context.session.subscribe_elicitation_pause_state()),
             deadline,
@@ -582,9 +581,18 @@ impl UnifiedExecProcessManager {
             collected_output.total_bytes(),
         ))
         .unwrap_or(usize::MAX);
-        let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-        let collected = collected_output.to_bytes_with_omission_marker();
-        let text = String::from_utf8_lossy(&collected).to_string();
+        let sandbox_text =
+            String::from_utf8_lossy(&collected_output.to_bytes_with_omission_marker()).to_string();
+        let (collected, output_omitted_bytes, output_artifact) = super::recoverable_output(
+            Some(context.session.as_ref()),
+            Some(context.step_context.turn.as_ref()),
+            &mut collected_output,
+            /*spill*/
+            request
+                .max_output_tokens
+                .is_some_and(|limit| original_token_count > limit),
+        )
+        .await;
         let chunk_id = generate_chunk_id();
         if deferred_network_approval
             .as_ref()
@@ -602,7 +610,7 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 plugin_attribution.clone(),
                 Arc::clone(&transcript),
-                text.clone(),
+                sandbox_text.clone(),
                 message.clone(),
                 wall_time,
             )
@@ -623,7 +631,7 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 plugin_attribution.clone(),
                 Arc::clone(&transcript),
-                text.clone(),
+                sandbox_text.clone(),
                 message.clone(),
                 wall_time,
             )
@@ -653,7 +661,7 @@ impl UnifiedExecProcessManager {
                         return Err(fail_process_with_message(entry.process.as_ref(), message));
                     }
                     process
-                        .check_for_sandbox_denial_with_text(&text)
+                        .check_for_sandbox_denial_with_text(&sandbox_text)
                         .await
                         .map_err(|err| {
                             err.with_output_collection_metadata(
@@ -695,7 +703,7 @@ impl UnifiedExecProcessManager {
                     cwd.clone(),
                     plugin_attribution.clone(),
                     Arc::clone(&transcript),
-                    text.clone(),
+                    sandbox_text.clone(),
                     message.clone(),
                     wall_time,
                 )
@@ -717,7 +725,7 @@ impl UnifiedExecProcessManager {
                 Some(process_id.to_string()),
                 plugin_attribution.clone(),
                 Arc::clone(&transcript),
-                text.clone(),
+                sandbox_text.clone(),
                 exit,
                 wall_time,
             )
@@ -725,7 +733,7 @@ impl UnifiedExecProcessManager {
 
             self.release_process_id(request.process_id).await;
             process
-                .check_for_sandbox_denial_with_text(&text)
+                .check_for_sandbox_denial_with_text(&sandbox_text)
                 .await
                 .map_err(|err| {
                     err.with_output_collection_metadata(original_token_count, output_omitted_bytes)
@@ -749,6 +757,7 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
+            output_artifact,
             hook_command: Some(request.hook_command.clone()),
         };
 
@@ -832,7 +841,7 @@ impl UnifiedExecProcessManager {
         };
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected_output =
+        let mut collected_output =
             Self::collect_output_until_deadline(&output, pause_state, deadline).await;
         let wall_time = Instant::now().saturating_duration_since(start);
 
@@ -840,8 +849,20 @@ impl UnifiedExecProcessManager {
             collected_output.total_bytes(),
         ))
         .unwrap_or(usize::MAX);
-        let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-        let collected = collected_output.to_bytes_with_omission_marker();
+        let turn = request
+            .interaction_event
+            .as_ref()
+            .map(|event| event.turn.as_ref());
+        let (collected, output_omitted_bytes, output_artifact) = super::recoverable_output(
+            session.as_deref(),
+            turn,
+            &mut collected_output,
+            /*spill*/
+            request
+                .max_output_tokens
+                .is_some_and(|limit| original_token_count > limit),
+        )
+        .await;
         let chunk_id = generate_chunk_id();
         if network_approval
             .as_ref()
@@ -912,6 +933,7 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
+            output_artifact,
             hook_command: Some(hook_command),
         };
 
@@ -1346,7 +1368,9 @@ impl UnifiedExecProcessManager {
             output_closed_notify,
             cancellation_token,
         } = output;
-        let mut collected = HeadTailBuffer::default();
+        let mut collected = HeadTailBuffer::new_recoverable(
+            super::MAX_RECOVERABLE_EXEC_OUTPUT_BYTES,
+        );
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
         loop {
@@ -1361,7 +1385,7 @@ impl UnifiedExecProcessManager {
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
-                drained_output = std::mem::take(&mut *guard);
+                drained_output = guard.drain();
                 has_drained_output =
                     drained_output.retained_bytes() > 0 || drained_output.omitted_bytes() > 0;
                 if !has_drained_output {

@@ -335,6 +335,8 @@ pub struct ExecCommandToolOutput {
     pub original_token_count: Option<usize>,
     /// Bytes omitted by the output collection cap before model-facing truncation.
     pub output_omitted_bytes: Option<NonZeroUsize>,
+    /// True only when unified exec itself produced a managed artifact envelope.
+    pub output_artifact: bool,
     pub hook_command: Option<String>,
 }
 
@@ -439,6 +441,9 @@ impl ExecCommandToolOutput {
 
     fn truncated_output_with_policy(&self, policy: TruncationPolicy) -> String {
         let text = String::from_utf8_lossy(&self.raw_output).to_string();
+        if self.output_artifact {
+            return text;
+        }
         let Some(omitted_bytes) = self.output_omitted_bytes else {
             return formatted_truncate_text(&text, policy);
         };
@@ -493,6 +498,18 @@ impl ExecCommandToolOutput {
     }
 
     fn response_text(&self) -> String {
+        let raw = String::from_utf8_lossy(&self.raw_output).to_string();
+        if self.output_artifact {
+            let mut envelope: JsonValue = serde_json::from_str(&raw).unwrap_or_default();
+            envelope["execution"] = serde_json::json!({
+                "chunk_id": (!self.chunk_id.is_empty()).then_some(&self.chunk_id),
+                "wall_time_seconds": self.wall_time.as_secs_f64(),
+                "exit_code": self.exit_code,
+                "session_id": self.process_id,
+                "original_token_count": self.original_token_count,
+            });
+            return envelope.to_string();
+        }
         let header = self.response_header();
         let output_budget = (self.truncation_policy * 1.2)
             .byte_budget()

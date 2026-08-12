@@ -345,7 +345,11 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     exit_code: i32,
     duration: Duration,
 ) {
-    let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
+    let aggregated_output = if fallback_output.is_empty() {
+        resolve_aggregated_output(&transcript, fallback_output).await
+    } else {
+        fallback_output
+    };
     let output = ExecToolCallOutput {
         exit_code,
         stdout: StreamOutput::new(aggregated_output.clone()),

@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -73,8 +74,88 @@ pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+pub(crate) const MAX_RECOVERABLE_EXEC_OUTPUT_BYTES: usize = 2 * UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
+
+async fn recoverable_output(
+    session: Option<&Session>,
+    turn: Option<&TurnContext>,
+    output: &mut head_tail_buffer::HeadTailBuffer,
+    spill: bool,
+) -> (Vec<u8>, Option<NonZeroUsize>, bool) {
+    let original_bytes = output.total_bytes();
+    let omitted = NonZeroUsize::new(output.omitted_bytes());
+    if let Some(session) = session
+        && session.output_artifact_spilling_supported()
+        && (spill || omitted.is_some())
+        && let Some(bytes) = output.take_complete_bytes()
+    {
+        match session
+            .output_artifact_store()
+            .await
+            .store_bytes(&bytes)
+            .await
+        {
+            Ok(artifact) => {
+                let envelope = artifact.envelope(
+                    "text/plain",
+                    turn.map_or(4 * 1024, |turn| {
+                        codex_protocol::protocol::TruncationPolicy::from(
+                            turn.model_info.truncation_policy,
+                        )
+                        .byte_budget()
+                    })
+                    .clamp(
+                        crate::tool_output::MIN_ARTIFACT_ENVELOPE_BYTES,
+                        codex_history::STORE_BACKED_TOOL_OUTPUT_MAX_BYTES,
+                    ),
+                );
+                if let Some(turn) = turn {
+                    crate::session::record_tool_output_projection(
+                        turn,
+                        &crate::tool_output::ProjectionMeasurement {
+                            original_bytes,
+                            inline_bytes: envelope.len(),
+                            outcome: "spilled",
+                            rule: if artifact.reused {
+                                "exact_digest_reuse_v1"
+                            } else {
+                                "spill_v1"
+                            },
+                            tool_family: "exec",
+                        },
+                    );
+                }
+                return (envelope.into_bytes(), None, true);
+            }
+            Err(err) => tracing::warn!(
+                error_kind = ?err.kind(),
+                "unified exec output spill failed; using bounded truncation"
+            ),
+        }
+    }
+    let bytes = output.to_bytes_with_omission_marker();
+    if (spill || omitted.is_some() || output.capture_limit_exceeded())
+        && let Some(turn) = turn
+    {
+        crate::session::record_tool_output_projection(
+            turn,
+            &crate::tool_output::ProjectionMeasurement {
+                original_bytes,
+                inline_bytes: bytes.len(),
+                outcome: "fallback",
+                rule: if output.capture_limit_exceeded() {
+                    "capture_quota_fallback_v1"
+                } else {
+                    "spill_failure_truncate_v1"
+                },
+                tool_family: "exec",
+            },
+        );
+    }
+    (bytes, omitted, false)
+}
 
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,

@@ -26,6 +26,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::shell_environment::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
 use codex_protocol::user_input::UserInput;
@@ -83,6 +84,23 @@ struct ParsedUnifiedExecOutput {
 }
 
 fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
+    if let Ok(envelope) = serde_json::from_str::<Value>(raw)
+        && envelope.get("type").and_then(Value::as_str) == Some("tool_output_artifact")
+    {
+        let execution = &envelope["execution"];
+        return Ok(ParsedUnifiedExecOutput {
+            chunk_id: execution["chunk_id"].as_str().map(str::to_string),
+            wall_time_seconds: execution["wall_time_seconds"].as_f64().unwrap_or_default(),
+            process_id: execution["session_id"].as_i64().map(|id| id.to_string()),
+            exit_code: execution["exit_code"]
+                .as_i64()
+                .and_then(|code| i32::try_from(code).ok()),
+            original_token_count: execution["original_token_count"]
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok()),
+            output: raw.to_string(),
+        });
+    }
     static OUTPUT_REGEX: OnceLock<Regex> = OnceLock::new();
     let regex = OUTPUT_REGEX.get_or_init(|| {
         Regex::new(concat!(
@@ -1790,10 +1808,9 @@ async fn exec_command_reports_chunk_and_exit_metadata() -> Result<()> {
     assert_eq!(exit_code, 0, "expected successful exit");
 
     let output_text = &metadata.output;
-    assert!(
-        output_text.contains("tokens truncated"),
-        "expected truncation notice in output: {output_text:?}"
-    );
+    let artifact: Value = serde_json::from_str(output_text)?;
+    assert_eq!(artifact["type"], "tool_output_artifact");
+    assert!(artifact["retrieval"].as_str().is_some());
 
     let original_tokens = metadata
         .original_token_count
@@ -1815,9 +1832,12 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
-        config.tool_output_token_limit = Some(50);
-    });
+    let mut builder = test_codex()
+        .with_model("gpt-5.4")
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_config(|config| {
+            config.tool_output_token_limit = Some(50);
+        });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-clamped-max-output";
@@ -1839,7 +1859,7 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
             ev_completed("resp-2"),
         ]),
     ];
-    mount_sse_sequence(&server, responses).await;
+    let request_log = mount_sse_sequence(&server, responses).await;
 
     submit_unified_exec_turn(
         &test,
@@ -1850,17 +1870,36 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
 
     let output = wait_for_raw_unified_exec_output(&test, call_id).await?;
     assert_eq!(output.original_token_count, Some(8_991));
-    let output_text = output.output.replace("\r\n", "\n");
-    assert_regex_match(
-        r"(?s)^Warning: truncated output \(original token count: 8991\)\nTotal output lines: 999\n\nEXEC-LINE-.*…\d+ tokens truncated…x+\n$",
-        &output_text,
+    assert!(output.output.contains("EXEC-LINE-0999"));
+
+    let projected = request_log.requests()[1]
+        .function_call_output_text(call_id)
+        .context("projected exec output")?;
+    let artifact: Value = serde_json::from_str(&projected)?;
+    assert_eq!(artifact["type"], "tool_output_artifact");
+    assert!(
+        artifact["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 999)
     );
-    assert_eq!(output_text.matches("tokens truncated").count(), 1);
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    test.codex.flush_rollout().await?;
+
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .as_ref()
+        .context("rollout path")?;
+    let rollout = std::fs::read_to_string(rollout_path)?;
+    assert!(
+        rollout.contains("Warning: truncated output"),
+        "rollout did not contain the durable display projection"
+    );
+    assert!(!rollout.contains("EXEC-LINE-0500"));
 
     Ok(())
 }
@@ -1919,7 +1958,7 @@ async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Res
             ev_completed("resp-3"),
         ]),
     ];
-    mount_sse_sequence(&server, responses).await;
+    let request_log = mount_sse_sequence(&server, responses).await;
 
     submit_unified_exec_turn(
         &test,
@@ -1936,12 +1975,18 @@ async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Res
 
     let stdin_output = wait_for_raw_unified_exec_output(&test, stdin_call_id).await?;
     assert_eq!(stdin_output.original_token_count, Some(9_492));
-    let stdin_output_text = stdin_output.output.replace("\r\n", "\n");
-    assert_regex_match(
-        r"(?s)^Warning: truncated output \(original token count: 9492\)\nTotal output lines: 1000\n\ngo\nSTDIN.*…\d+ tokens truncated…y+\n$",
-        &stdin_output_text,
+    assert!(stdin_output.output.contains("STDIN-LINE-0999"));
+
+    let projected = request_log.requests()[2]
+        .function_call_output_text(stdin_call_id)
+        .context("projected stdin output")?;
+    let artifact: Value = serde_json::from_str(&projected)?;
+    assert_eq!(artifact["type"], "tool_output_artifact");
+    assert!(
+        artifact["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 999)
     );
-    assert_eq!(stdin_output_text.matches("tokens truncated").count(), 1);
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -3214,13 +3259,22 @@ PY
     let outputs = collect_tool_outputs(&bodies)?;
     let large_output = outputs.get(call_id).expect("missing large output summary");
 
-    let output_text = large_output.output.replace("\r\n", "\n");
-    assert!(output_text.starts_with(&format!(
-        "Warning: truncated output (original token count: {expected_original_token_count})\n"
-    )));
-    assert_regex_match(r"\.\.\. \d+ bytes omitted \.\.\.", &output_text);
-    assert!(output_text.contains("HEAD\n"));
-    assert!(output_text.contains("TAIL\n"));
+    let artifact: Value = serde_json::from_str(&large_output.output)?;
+    assert_eq!(artifact["type"], "tool_output_artifact");
+    assert_eq!(
+        artifact["execution"]["original_token_count"],
+        expected_original_token_count
+    );
+    assert!(
+        artifact["preview"]["head"]
+            .as_str()
+            .is_some_and(|text| text.contains("HEAD\n"))
+    );
+    assert!(
+        artifact["preview"]["tail"]
+            .as_str()
+            .is_some_and(|text| text.contains("TAIL\n"))
+    );
     assert_eq!(
         large_output.original_token_count,
         Some(expected_original_token_count)
@@ -3721,3 +3775,4 @@ fn assert_command(command: &[String], expected_args: &str, expected_cmd: &str) {
     assert_eq!(command[1], expected_args);
     assert_eq!(command[2], expected_cmd);
 }
+

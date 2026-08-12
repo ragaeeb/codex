@@ -410,6 +410,7 @@ fn exec_command_tool_output_formats_truncated_response() {
         exit_code: Some(0),
         original_token_count: Some(10),
         output_omitted_bytes: None,
+        output_artifact: false,
         hook_command: None,
     };
     assert_eq!(
@@ -511,6 +512,7 @@ fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
         exit_code: Some(0),
         original_token_count: Some(42_000),
         output_omitted_bytes: NonZeroUsize::new(/*n*/ 123_456),
+        output_artifact: false,
         hook_command: None,
     };
     let expected_header = "Chunk ID: abc123\nWall time: 1.2500 seconds\nProcess exited with code 0\nOriginal token count: 42000\nOutput:\n";

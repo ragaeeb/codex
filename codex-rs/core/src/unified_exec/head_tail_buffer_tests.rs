@@ -43,6 +43,40 @@ fn head_budget_zero_keeps_only_last_byte_in_tail() {
 }
 
 #[test]
+fn recoverable_capture_is_opt_in_and_hard_capped() {
+    let mut preview_only = HeadTailBuffer::<4>::default();
+    preview_only.push_chunk(b"abcdef");
+    assert_eq!(preview_only.take_complete_bytes(), None);
+    assert!(!preview_only.capture_limit_exceeded());
+
+    let mut recoverable = HeadTailBuffer::<4>::new_recoverable(6);
+    recoverable.push_chunk(b"abcdef");
+    assert_eq!(recoverable.take_complete_bytes(), Some(b"abcdef".to_vec()));
+
+    let mut over_limit = HeadTailBuffer::<4>::new_recoverable(5);
+    over_limit.push_chunk(b"abcdef");
+    assert_eq!(over_limit.take_complete_bytes(), None);
+    assert!(over_limit.capture_limit_exceeded());
+}
+
+#[test]
+fn draining_preserves_complete_capture_for_push_buffer() {
+    let mut buf = HeadTailBuffer::<10>::new_recoverable(32);
+    buf.push_chunk(b"0123456789");
+    buf.push_chunk(b"ab");
+
+    let drained = buf.drain();
+    let mut collected = HeadTailBuffer::<10>::new_recoverable(32);
+    collected.push_buffer(drained);
+
+    assert_eq!(buf.retained_bytes(), 0);
+    assert_eq!(buf.omitted_bytes(), 0);
+    assert_eq!(collected.to_bytes(), b"01234789ab");
+    assert_eq!(collected.omitted_bytes(), 2);
+    assert_eq!(collected.take_complete_bytes(), Some(b"0123456789ab".to_vec()));
+}
+
+#[test]
 fn chunk_larger_than_tail_budget_keeps_only_tail_end() {
     let mut buf = HeadTailBuffer::<10>::default();
     buf.push_chunk(b"0123456789");
