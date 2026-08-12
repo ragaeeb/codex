@@ -595,8 +595,13 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
         post_tool_use_payload: None,
     };
 
+    let response = result.into_response();
     assert_eq!(
-        result.into_response(),
+        response.provenance,
+        codex_tools::ToolOutputProvenance::Untrusted
+    );
+    assert_eq!(
+        response.item,
         ResponseInputItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
             output: codex_protocol::models::FunctionCallOutputPayload::from_text(

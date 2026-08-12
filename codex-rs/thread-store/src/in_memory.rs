@@ -850,6 +850,10 @@ impl ThreadStore for InMemoryThreadStore {
         self
     }
 
+    fn supports_local_output_artifacts(&self) -> bool {
+        true
+    }
+
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(InMemoryThreadStore::create_thread(self, params))
     }

@@ -98,7 +98,6 @@ fn mcp_tool_output_response_item_includes_wall_time() {
         tool_input: json!({}),
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(1024),
     };
 
     let response = output.to_response_item(
@@ -134,7 +133,7 @@ fn mcp_tool_output_response_item_includes_wall_time() {
 }
 
 #[test]
-fn mcp_tool_output_response_item_truncates_large_structured_content() {
+fn mcp_tool_output_response_item_defers_large_structured_content_projection() {
     let output = McpToolOutput {
         result: CallToolResult {
             content: vec![serde_json::json!({
@@ -150,7 +149,6 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
         tool_input: json!({}),
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(128),
     };
 
     assert_eq!(
@@ -176,7 +174,7 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
                 .to_text()
                 .expect("MCP output should serialize as text");
             assert!(text.starts_with("Wall time: 1.2500 seconds\nOutput:\n"));
-            assert!(text.contains("chars truncated"));
+            assert!(text.contains("large structured value"));
             assert!(!text.contains("ignored when structured content is present"));
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
@@ -200,7 +198,6 @@ fn mcp_tool_output_response_item_preserves_content_items() {
         tool_input: json!({}),
         wall_time: std::time::Duration::from_millis(500),
         original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(1024),
     };
 
     let response = output.to_response_item(
@@ -256,7 +253,6 @@ fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata()
         tool_input: json!({}),
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(64),
     };
 
     let result = output.code_mode_result(&ToolPayload::Function {

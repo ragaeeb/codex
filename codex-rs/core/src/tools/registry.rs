@@ -16,6 +16,7 @@ use crate::sandbox_tags::permission_profile_sandbox_tag;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ModelToolCallResponse;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -191,14 +192,17 @@ pub(crate) struct AnyToolResult {
 }
 
 impl AnyToolResult {
-    pub(crate) fn into_response(self) -> ResponseInputItem {
+    pub(crate) fn into_response(self) -> ModelToolCallResponse {
         let Self {
             call_id,
             payload,
             result,
             ..
         } = self;
-        result.to_response_item(&call_id, &payload)
+        ModelToolCallResponse {
+            item: result.to_response_item(&call_id, &payload),
+            provenance: result.provenance(),
+        }
     }
 
     pub(crate) fn code_mode_result(self) -> serde_json::Value {

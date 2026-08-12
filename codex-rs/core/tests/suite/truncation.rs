@@ -44,8 +44,16 @@ fn assert_wall_time_header(output: &str) {
     assert_eq!(marker, "Output:");
 }
 
-// Verifies that a standard tool call (exec_command) exceeding the model formatting
-// limits is truncated before being sent back to the model.
+fn output_artifact(output: &str) -> Value {
+    let artifact: Value = serde_json::from_str(output).expect("tool output artifact");
+    assert_eq!(artifact["type"], "tool_output_artifact");
+    assert!(artifact["artifact_id"].as_str().is_some());
+    assert!(artifact["retrieval"].as_str().is_some());
+    artifact
+}
+
+// Verifies that a standard tool call exceeding the model formatting limit is
+// represented by a recoverable artifact before being sent back to the model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_call_output_configured_limit_chars_type() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -105,21 +113,10 @@ async fn tool_call_output_configured_limit_chars_type() -> Result<()> {
         .context("function_call_output present for shell call")?;
     let output = output.replace("\r\n", "\n");
 
-    // Expect plain text (not JSON) containing the entire shell output.
     assert!(
-        serde_json::from_str::<Value>(&output).is_err(),
-        "expected truncated shell output to be plain text"
-    );
-
-    assert!(
-        (400_000..=401_000).contains(&output.len()),
-        "expected output near the configured 100k-token budget, got {} bytes",
-        output.len()
-    );
-
-    assert!(
-        output.contains("chars truncated"),
-        "unified exec should preserve the model's byte-based truncation policy"
+        output_artifact(&output)["original_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 400_000)
     );
 
     Ok(())
@@ -183,20 +180,10 @@ async fn tool_call_output_exceeds_limit_truncated_chars_limit() -> Result<()> {
         .context("function_call_output present for shell call")?;
     let output = output.replace("\r\n", "\n");
 
-    // Expect plain text (not JSON) containing the entire shell output.
     assert!(
-        serde_json::from_str::<Value>(&output).is_err(),
-        "expected truncated shell output to be plain text"
-    );
-
-    let truncated_pattern = r#"(?s)^Chunk ID: [^\n]+\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nProcess exited with code 0\nOriginal token count: \d+\nOutput:\nWarning: truncated output \(original token count: \d+\)\nTotal output lines: 100000\n\n.*?…\d+ chars truncated….*$"#;
-
-    assert_regex_match(truncated_pattern, &output);
-
-    let len = output.len();
-    assert!(
-        (9_900..=10_500).contains(&len),
-        "expected ~10k chars after truncation, got {len}"
+        output_artifact(&output)["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 100_000)
     );
 
     Ok(())
@@ -259,30 +246,11 @@ async fn tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> {
         .context("function_call_output present for shell call")?;
     let output = output.replace("\r\n", "\n");
 
-    // Expect plain text (not JSON) containing the entire shell output.
     assert!(
-        serde_json::from_str::<Value>(&output).is_err(),
-        "expected truncated shell output to be plain text"
+        output_artifact(&output)["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 100_000)
     );
-    let truncated_pattern = r#"(?s)^Chunk ID: [^\n]+
-Wall time: [0-9]+(?:\.[0-9]+)? seconds
-Process exited with code 0
-Original token count: \d+
-Output:
-Warning: truncated output \(original token count: \d+\)
-Total output lines: 100000
-
-1
-2
-3
-4
-5
-6
-.*…\d+ tokens truncated.*
-99999
-100000
-$"#;
-    assert_regex_match(truncated_pattern, &output);
 
     Ok(())
 }
@@ -623,11 +591,11 @@ async fn token_policy_marker_reports_tokens() -> Result<()> {
         .function_call_output_text(call_id)
         .context("shell output present")?;
 
-    let pattern = r"(?s)^Chunk ID: [^\n]+\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nProcess exited with code 0\nOriginal token count: \d+\nOutput:\nWarning: truncated output \(original token count: \d+\)\nTotal output lines: 150\n\n1\n2\n3\n.*…\d+ tokens truncated….*149\n150\n$";
-
-    assert_regex_match(pattern, &output);
-    assert_eq!(output.matches("tokens truncated").count(), 1);
-    assert!(output.len() <= (TruncationPolicy::Tokens(50) * 1.2).byte_budget());
+    assert!(
+        output_artifact(&output)["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 150)
+    );
 
     Ok(())
 }
@@ -676,11 +644,11 @@ async fn byte_policy_marker_reports_bytes() -> Result<()> {
         .function_call_output_text(call_id)
         .context("shell output present")?;
 
-    let pattern = r"(?s)^Chunk ID: [^\n]+\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nProcess exited with code 0\nOriginal token count: \d+\nOutput:\nWarning: truncated output \(original token count: \d+\)\nTotal output lines: 150\n\n1\n2\n3\n.*…\d+ chars truncated….*149\n150\n$";
-
-    assert_regex_match(pattern, &output);
-    assert_eq!(output.matches("chars truncated").count(), 1);
-    assert!(output.len() <= (TruncationPolicy::Bytes(200) * 1.2).byte_budget());
+    assert!(
+        output_artifact(&output)["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 150)
+    );
 
     Ok(())
 }

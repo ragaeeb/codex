@@ -1,4 +1,3 @@
-use crate::context_manager::truncate_function_output_payload;
 use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -27,6 +26,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub use codex_tools::ToolOutput;
+use codex_tools::ToolOutputProvenance;
 pub use codex_tools::ToolPayload;
 
 pub(crate) fn boxed_tool_output<T>(output: T) -> Box<dyn ToolOutput>
@@ -66,13 +66,17 @@ pub struct ToolInvocation {
     pub payload: ToolPayload,
 }
 
+pub(crate) struct ModelToolCallResponse {
+    pub(crate) item: ResponseInputItem,
+    pub(crate) provenance: ToolOutputProvenance,
+}
+
 #[derive(Clone, Debug)]
 pub struct McpToolOutput {
     pub result: CallToolResult,
     pub tool_input: JsonValue,
     pub wall_time: Duration,
     pub original_image_detail_supported: bool,
-    pub truncation_policy: TruncationPolicy,
 }
 
 impl ToolOutput for McpToolOutput {
@@ -135,13 +139,7 @@ impl McpToolOutput {
             }
         }
 
-        // This is the context-injection form, so keep it aligned with the
-        // function-call output truncation that conversation history already
-        // applies. Code-mode consumers still get the raw `CallToolResult`.
-        //
-        // The text is serialized again inside the Responses payload, so allow
-        // a small buffer for JSON escaping and wrapper overhead.
-        truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
+        payload
     }
 }
 
@@ -190,6 +188,7 @@ pub struct FunctionToolOutput {
     pub body: Vec<FunctionCallOutputContentItem>,
     pub success: Option<bool>,
     pub post_tool_use_response: Option<JsonValue>,
+    pub(crate) provenance: ToolOutputProvenance,
 }
 
 impl FunctionToolOutput {
@@ -198,6 +197,16 @@ impl FunctionToolOutput {
             body: vec![FunctionCallOutputContentItem::InputText { text }],
             success,
             post_tool_use_response: None,
+            provenance: ToolOutputProvenance::Untrusted,
+        }
+    }
+
+    pub(crate) fn from_managed_artifact_text(text: String) -> Self {
+        Self {
+            body: vec![FunctionCallOutputContentItem::InputText { text }],
+            success: Some(true),
+            post_tool_use_response: None,
+            provenance: ToolOutputProvenance::ManagedArtifactRetrieval,
         }
     }
 
@@ -209,6 +218,7 @@ impl FunctionToolOutput {
             body: content,
             success,
             post_tool_use_response: None,
+            provenance: ToolOutputProvenance::Untrusted,
         }
     }
 
@@ -224,6 +234,10 @@ impl ToolOutput for FunctionToolOutput {
 
     fn success_for_logging(&self) -> bool {
         self.success.unwrap_or(true)
+    }
+
+    fn provenance(&self) -> ToolOutputProvenance {
+        self.provenance
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

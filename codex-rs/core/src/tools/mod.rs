@@ -29,7 +29,6 @@ use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text;
-use codex_utils_output_truncation::truncate_text;
 pub(crate) use executed_tool_calls::ExecutedToolCallRecorder;
 pub use router::ToolRouter;
 
@@ -89,30 +88,19 @@ pub(crate) fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
 }
 
 /// Format the combined exec output for sending back to the model.
-/// Includes exit code and duration metadata; truncates large bodies safely.
-pub fn format_exec_output_for_model(
-    exec_output: &ExecToolCallOutput,
-    truncation_policy: TruncationPolicy,
-) -> String {
+/// Includes exit code and duration metadata; the shared projector bounds large bodies.
+pub fn format_exec_output_for_model(exec_output: &ExecToolCallOutput) -> String {
     // round to 1 decimal place
     let duration_seconds = ((exec_output.duration.as_secs_f32()) * 10.0).round() / 10.0;
 
     let content = build_content_with_timeout(exec_output);
 
-    let total_lines = content.lines().count();
-
-    let formatted_output = truncate_text(&content, truncation_policy);
-
     let mut sections = Vec::new();
 
     sections.push(format!("Exit code: {}", exec_output.exit_code));
     sections.push(format!("Wall time: {duration_seconds} seconds"));
-    if total_lines != formatted_output.lines().count() {
-        sections.push(format!("Total output lines: {total_lines}"));
-    }
-
     sections.push("Output:".to_string());
-    sections.push(formatted_output);
+    sections.push(content);
 
     sections.join("\n")
 }

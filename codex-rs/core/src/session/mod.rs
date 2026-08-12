@@ -212,6 +212,43 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
+pub(crate) fn record_tool_output_projection(
+    turn_context: &crate::session::turn_context::TurnContext,
+    measurement: &crate::tool_output::ProjectionMeasurement,
+) {
+    let tags = [
+        ("outcome", measurement.outcome),
+        ("rule", measurement.rule),
+        ("tool_family", measurement.tool_family),
+    ];
+    let telemetry = &turn_context.session_telemetry;
+    telemetry.counter("codex.tool_output.projection", /*inc*/ 1, &tags);
+    let original = i64::try_from(measurement.original_bytes).unwrap_or(i64::MAX);
+    let inline = i64::try_from(measurement.inline_bytes).unwrap_or(i64::MAX);
+    for (name, value) in [
+        ("codex.tool_output.original_bytes", original),
+        (
+            "codex.tool_output.original_tokens",
+            codex_utils_output_truncation::approx_tokens_from_byte_count_i64(original),
+        ),
+        ("codex.tool_output.inline_bytes", inline),
+        (
+            "codex.tool_output.inline_tokens",
+            codex_utils_output_truncation::approx_tokens_from_byte_count_i64(inline),
+        ),
+        (
+            "codex.tool_output.spilled_bytes",
+            if measurement.outcome == "spilled" {
+                original
+            } else {
+                0
+            },
+        ),
+    ] {
+        telemetry.histogram(name, value, &tags);
+    }
+}
+
 mod code_mode_warning;
 pub(crate) mod context_window;
 mod environment;
@@ -297,6 +334,7 @@ use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::tasks::ReviewTask;
 use crate::tools::ApprovalContext;
+use crate::tools::context::ModelToolCallResponse;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::network_approval::build_blocked_request_observer;
 use crate::tools::network_approval::build_network_policy_decider;
@@ -367,6 +405,7 @@ use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
 use codex_skills_extension::HostSkillsService;
 use codex_tools::ToolName;
+use codex_tools::ToolOutputProvenance;
 use codex_tools::UnifiedExecShellMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
@@ -1188,6 +1227,23 @@ impl Session {
         state.session_configuration.codex_home().clone()
     }
 
+    pub(crate) async fn output_artifact_store(
+        &self,
+    ) -> codex_utils_output_truncation::OutputArtifactStore {
+        let state = self.state.lock().await;
+        codex_utils_output_truncation::OutputArtifactStore::new(
+            state
+                .session_configuration
+                .codex_home()
+                .join("tool_outputs")
+                .join(self.thread_id.to_string()),
+        )
+    }
+
+    pub(crate) fn output_artifact_spilling_supported(&self) -> bool {
+        self.services.thread_store.supports_local_output_artifacts()
+    }
+
     pub(crate) fn subscribe_elicitation_pause_state(&self) -> watch::Receiver<bool> {
         self.services.elicitations.subscribe()
     }
@@ -1992,7 +2048,7 @@ impl Session {
             id: turn_context.sub_id.clone(),
             msg,
         };
-        self.send_event_raw(event).await;
+        self.send_projected_event(event, turn_context).await;
         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
             .await;
         self.maybe_mirror_event_text_to_realtime(&legacy_source)
@@ -2009,7 +2065,7 @@ impl Session {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
             };
-            self.send_event_raw(legacy_event).await;
+            self.send_projected_event(legacy_event, turn_context).await;
         }
     }
 
@@ -2246,6 +2302,19 @@ impl Session {
             }
         };
         self.send_event_raw_with_persistence(event, persist).await;
+    }
+
+    pub(crate) async fn send_projected_event(&self, event: Event, turn_context: &TurnContext) {
+        let projector = crate::tool_output::ToolOutputProjector::new(
+            self.output_artifact_store().await,
+            turn_context.model_info.truncation_policy.into(),
+        )
+        .with_spilling_supported(self.output_artifact_spilling_supported());
+        let message = projector.project_event_msg(&event.msg).await;
+        self.persist_rollout_items(&[RolloutItem::EventMsg(message)])
+            .await;
+        self.send_event_raw_with_persistence(event, /*persist*/ false)
+            .await;
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
@@ -3177,27 +3246,75 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
+        self.record_conversation_items_with_provenance(
+            turn_context,
+            items,
+            ToolOutputProvenance::Untrusted,
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_model_tool_call_response(
+        &self,
+        turn_context: &TurnContext,
+        response: ModelToolCallResponse,
+    ) -> ResponseItem {
+        let ModelToolCallResponse { item, provenance } = response;
+        let item = ResponseItem::from(item);
+        self.record_conversation_items_with_provenance(
+            turn_context,
+            std::slice::from_ref(&item),
+            provenance,
+        )
+        .await;
+        item
+    }
+
+    async fn record_conversation_items_with_provenance(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        provenance: ToolOutputProvenance,
+    ) {
         let (items, image_preparations) =
             self.prepare_conversation_items_for_history(turn_context, items);
-        let items = items
-            .into_owned()
-            .into_iter()
-            .map(ResponseItemEnvelope::new)
-            .collect();
-        self.record_prepared_conversation_items(turn_context, items, image_preparations)
-            .await;
+        let raw_items = items.as_ref();
+        let store = self.output_artifact_store().await;
+        let projector = crate::tool_output::ToolOutputProjector::new(
+            store,
+            turn_context.model_info.truncation_policy.into(),
+        )
+        .with_spilling_supported(self.output_artifact_spilling_supported());
+        let mut projected_items = Vec::with_capacity(raw_items.len());
+        for item in raw_items {
+            let (projected, measurement) = if provenance == ToolOutputProvenance::Untrusted {
+                projector.project_response_item(item).await
+            } else {
+                projector
+                    .project_response_item_with_provenance(item, provenance)
+                    .await
+            };
+            if let Some(measurement) = &measurement {
+                record_tool_output_projection(turn_context, measurement);
+            }
+            projected_items.push(projected);
+        }
+        self.record_prepared_conversation_items(
+            turn_context,
+            projected_items,
+            raw_items.to_vec(),
+            image_preparations,
+        )
+        .await;
     }
 
     async fn record_prepared_conversation_items(
         &self,
         turn_context: &TurnContext,
         items: Vec<ResponseItemEnvelope>,
+        response_items: Vec<ResponseItem>,
         image_preparations: Vec<ImagePreparationMetadata>,
     ) {
-        let response_items = items
-            .iter()
-            .map(|envelope| envelope.item.clone())
-            .collect::<Vec<_>>();
         {
             let mut state = self.state.lock().await;
             state
@@ -3400,7 +3517,9 @@ impl Session {
         let response_item = items[0].clone();
         {
             let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
+            state
+                .current_time_reminder
+                .note_recorded_items(items.iter());
             state.record_items(
                 items.iter(),
                 turn_context.model_info().truncation_policy.into(),

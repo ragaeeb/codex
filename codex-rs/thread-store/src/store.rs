@@ -69,6 +69,12 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Return this store as [`Any`] for implementation-owned escape hatches.
     fn as_any(&self) -> &dyn Any;
 
+    /// Whether this backend's threads remain bound to the current Codex home, so opaque local
+    /// output artifacts can safely participate in resume and fork behavior.
+    fn supports_local_output_artifacts(&self) -> bool {
+        false
+    }
+
     /// Returns the history mode to use when history does not carry a persisted mode.
     ///
     /// The default is legacy so existing stores stay compatible. Stores whose durable contract is

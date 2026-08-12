@@ -115,10 +115,13 @@ struct CoreTurnItemEmitter {
 async fn emit_legacy_events(session: &Session, turn: &TurnContext, legacy_events: Vec<EventMsg>) {
     for msg in legacy_events {
         session
-            .send_event_raw(Event {
-                id: turn.sub_id.clone(),
-                msg,
-            })
+            .send_projected_event(
+                Event {
+                    id: turn.sub_id.clone(),
+                    msg,
+                },
+                turn,
+            )
             .await;
     }
 }

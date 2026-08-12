@@ -547,11 +547,12 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
         .function_call_output_text(call_id)
         .context("function_call_output present for exec_command call")?;
 
-    let truncation_headers = output.matches("Total output lines:").count();
-
-    assert_eq!(
-        truncation_headers, 1,
-        "exec_command output should carry only one truncation header: {output}"
+    let artifact: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(artifact["type"], "tool_output_artifact");
+    assert!(
+        artifact["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 2_000)
     );
 
     Ok(())

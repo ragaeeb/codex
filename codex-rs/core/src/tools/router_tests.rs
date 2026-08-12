@@ -597,7 +597,7 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         .await?;
 
     let response = result.into_response();
-    match response {
+    match response.item {
         ResponseInputItem::FunctionCallOutput { call_id, output } => {
             assert_eq!(call_id, "call-extension");
             let FunctionCallOutputBody::Text(text) = output.body else {
