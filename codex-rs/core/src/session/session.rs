@@ -708,6 +708,27 @@ impl Session {
                 ));
             }
         };
+        if thread_store.supports_local_output_artifacts() {
+            crate::tool_output::sweep_expired_artifacts_once(&config.codex_home).await;
+        }
+        let inherited_output_artifact_ids = if matches!(&initial_history, InitialHistory::Forked(_))
+        {
+            crate::tool_output::referenced_output_artifact_ids(&initial_history)
+        } else {
+            Vec::new()
+        };
+        let inherited_output_artifact_source = if inherited_output_artifact_ids.is_empty() {
+            None
+        } else {
+            if !thread_store.supports_local_output_artifacts() {
+                anyhow::bail!(
+                    "fork history references output artifacts that this thread store cannot transfer"
+                );
+            }
+            Some(forked_from_id.or(parent_thread_id).ok_or_else(|| {
+                anyhow::anyhow!("fork history references output artifacts without a source thread")
+            })?)
+        };
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {
@@ -939,7 +960,41 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?);
+        let inherited_output_artifact_stores =
+            inherited_output_artifact_source.map(|source_thread_id| {
+                let managed_root = config.codex_home.join("tool_outputs");
+                (
+                    codex_utils_output_truncation::OutputArtifactStore::new(
+                        managed_root.join(source_thread_id.to_string()),
+                    ),
+                    codex_utils_output_truncation::OutputArtifactStore::new(
+                        managed_root.join(thread_id.to_string()),
+                    ),
+                    source_thread_id,
+                )
+            });
+        let mut inherited_output_artifacts = false;
         let session_result: anyhow::Result<Arc<Self>> = async {
+            if let Some((source, destination, source_thread_id)) =
+                &inherited_output_artifact_stores
+            {
+                if let Err(err) = source
+                    .copy_to(destination, &inherited_output_artifact_ids)
+                    .await
+                {
+                    if let Err(cleanup_err) = destination.remove_thread().await {
+                        warn!(
+                            child_thread_id = %thread_id,
+                            error_kind = ?cleanup_err.kind(),
+                            "failed to clean partial fork output artifacts"
+                        );
+                    }
+                    return Err(anyhow::anyhow!(
+                        "failed to inherit output artifacts from thread {source_thread_id}: {err}"
+                    ));
+                }
+                inherited_output_artifacts = true;
+            }
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
@@ -1555,6 +1610,16 @@ impl Session {
             }
             Err(err) => {
                 live_thread_init.discard().await;
+                if inherited_output_artifacts
+                    && let Some((_, destination, _)) = &inherited_output_artifact_stores
+                    && let Err(cleanup_err) = destination.remove_thread().await
+                {
+                    warn!(
+                        child_thread_id = %thread_id,
+                        error_kind = ?cleanup_err.kind(),
+                        "failed to clean inherited output artifacts after session startup"
+                    );
+                }
                 Err(err)
             }
         }

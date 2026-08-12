@@ -7887,6 +7887,23 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
 }
 
 #[tokio::test]
+async fn shutdown_removes_ephemeral_output_artifacts() -> anyhow::Result<()> {
+    let session = make_session_with_config(|config| config.ephemeral = true).await?;
+    assert!(session.output_artifact_spilling_supported());
+    let artifact = session
+        .output_artifact_store()
+        .await
+        .store_text("ephemeral tool output")
+        .await?;
+    assert!(tokio::fs::try_exists(artifact.diagnostic_path.as_path()).await?);
+
+    assert!(handlers::shutdown(&session, "sub-1".to_string()).await);
+
+    assert!(!tokio::fs::try_exists(artifact.diagnostic_path.as_path()).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn submission_loop_channel_close_runs_full_thread_teardown() {
     struct SessionStopMarker;
     struct ThreadStopMarker;

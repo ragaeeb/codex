@@ -43,6 +43,8 @@ struct BarrierArgs {
 #[derive(Debug, Deserialize)]
 struct TestSyncArgs {
     #[serde(default)]
+    output_json_rows: Option<usize>,
+    #[serde(default)]
     sleep_before_ms: Option<u64>,
     #[serde(default)]
     sleep_after_ms: Option<u64>,
@@ -126,8 +128,17 @@ impl TestSyncHandler {
             sleep(Duration::from_millis(delay)).await;
         }
 
+        let output = match args.output_json_rows {
+            Some(rows) => serde_json::to_string_pretty(&serde_json::json!({
+                "rows": (0..rows)
+                    .map(|index| format!("row-{index:04}-middle-marker"))
+                    .collect::<Vec<_>>()
+            }))
+            .unwrap_or_default(),
+            None => "ok".to_string(),
+        };
         Ok(boxed_tool_output(FunctionToolOutput::from_text(
-            "ok".to_string(),
+            output,
             Some(true),
         )))
     }

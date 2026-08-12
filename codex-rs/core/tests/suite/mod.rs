@@ -162,6 +162,7 @@ mod subagent_notifications;
 mod token_budget;
 mod tool_harness;
 mod tool_lifecycle;
+mod tool_output_artifacts;
 mod tool_parallelism;
 mod tools;
 mod truncation;

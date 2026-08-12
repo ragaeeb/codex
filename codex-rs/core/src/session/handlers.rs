@@ -414,6 +414,17 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+
+    if sess.thread_config_snapshot().await.ephemeral
+        && sess.output_artifact_spilling_supported()
+        && let Err(err) = sess.output_artifact_store().await.remove_thread().await
+    {
+        warn!(
+            thread_id = %sess.thread_id(),
+            error_kind = ?err.kind(),
+            "failed to clean ephemeral output artifacts during session shutdown"
+        );
+    }
 }
 
 pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {

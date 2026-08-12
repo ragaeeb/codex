@@ -1495,6 +1495,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
+    config.tool_output_token_limit = Some(128);
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let auth_manager =
@@ -1534,6 +1535,54 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         })
         .await
         .expect("start source thread");
+    let inherited_output = "fork-inherited tool output\n".repeat(100);
+    let inherited_artifact_id =
+        codex_utils_output_truncation::OutputArtifactId::for_text(&inherited_output);
+    let source_turn = source
+        .thread
+        .session
+        .new_turn_with_sub_id(
+            "artifact-turn".to_string(),
+            SessionSettingsUpdate::default(),
+        )
+        .await
+        .expect("build source turn context");
+    source
+        .thread
+        .session
+        .record_conversation_items(
+            &source_turn,
+            &[
+                ResponseItem::FunctionCall {
+                    id: None,
+                    call_id: "artifact-call".to_string(),
+                    name: "test_tool".to_string(),
+                    namespace: None,
+                    arguments: "{}".to_string(),
+                    encrypted_function_args: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "artifact-call".to_string(),
+                    output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                        inherited_output.clone(),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+        )
+        .await;
+    let parent_artifacts = codex_utils_output_truncation::OutputArtifactStore::new(
+        config
+            .codex_home
+            .join("tool_outputs")
+            .join(source.thread_id.to_string()),
+    );
+    let unreferenced_artifact = parent_artifacts
+        .store_text("unreferenced parent output")
+        .await
+        .expect("store unreferenced parent artifact");
     source.thread.ensure_rollout_materialized().await;
     source
         .thread
@@ -1627,6 +1676,39 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
             .expect("primary environment")
             .cwd(),
         &PathUri::from_abs_path(&selected_cwd)
+    );
+    let fork_artifacts = codex_utils_output_truncation::OutputArtifactStore::new(
+        default_cwd
+            .join("tool_outputs")
+            .join(forked.thread_id.to_string()),
+    );
+    parent_artifacts
+        .remove_thread()
+        .await
+        .expect("remove parent artifacts after fork");
+    assert_eq!(
+        fork_artifacts
+            .read_bytes(
+                &inherited_artifact_id,
+                /*offset*/ 0,
+                /*max_bytes*/ inherited_output.len(),
+            )
+            .await
+            .expect("read inherited fork artifact")
+            .0,
+        inherited_output
+    );
+    assert_eq!(
+        fork_artifacts
+            .read_bytes(
+                &unreferenced_artifact.id,
+                /*offset*/ 0,
+                /*max_bytes*/ 128,
+            )
+            .await
+            .expect_err("unreferenced artifact should not be copied")
+            .kind(),
+        std::io::ErrorKind::NotFound
     );
 }
 

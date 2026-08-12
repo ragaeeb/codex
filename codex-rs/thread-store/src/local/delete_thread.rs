@@ -16,6 +16,7 @@ use codex_rollout::SESSIONS_SUBDIR;
 use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_path_by_id_str;
 use codex_rollout::remove_thread_name_entries;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::LocalThreadStore;
 use super::helpers::scoped_rollout_path;
@@ -220,7 +221,24 @@ async fn delete_thread_after_reference_check(
             message: format!("failed to delete thread name index entries for {thread_id}: {err}"),
         })?;
 
-    if !found_rollout_path {
+    let codex_home =
+        AbsolutePathBuf::from_absolute_path(&store.config.codex_home).map_err(|err| {
+            ThreadStoreError::Internal {
+                message: format!("invalid Codex home while deleting thread {thread_id}: {err}"),
+            }
+        })?;
+    let artifact_store = codex_utils_output_truncation::OutputArtifactStore::new(
+        codex_home.join("tool_outputs").join(thread_id.to_string()),
+    );
+    let removed_artifacts = artifact_store.remove_thread().await.map_err(|err| {
+        ThreadStoreError::Internal {
+            message: format!(
+                "thread rollout was removed, but tool output artifact cleanup for {thread_id} failed and must be retried: {err}"
+            ),
+        }
+    })?;
+
+    if !found_rollout_path && !removed_artifacts {
         return Err(ThreadStoreError::ThreadNotFound { thread_id });
     }
 
@@ -311,14 +329,36 @@ mod tests {
 
         for (uuid, path) in cases {
             let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+            let artifacts = home.path().join("tool_outputs").join(thread_id.to_string());
+            std::fs::create_dir_all(&artifacts).expect("artifact directory");
+            std::fs::write(artifacts.join("output.txt"), b"output").expect("artifact");
             store
                 .delete_thread(DeleteThreadParams { thread_id })
                 .await
                 .expect("delete thread");
 
             assert!(!path.exists());
+            assert!(!artifacts.exists());
         }
         assert!(!compressed_path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_thread_reconciles_orphaned_output_artifacts() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let thread_id =
+            ThreadId::from_string(&Uuid::from_u128(9_001).to_string()).expect("thread id");
+        let artifacts = home.path().join("tool_outputs").join(thread_id.to_string());
+        std::fs::create_dir_all(&artifacts).expect("artifact directory");
+        std::fs::write(artifacts.join("output.txt"), b"orphan").expect("artifact");
+
+        store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect("orphan cleanup is a successful reconciliation");
+
+        assert!(!artifacts.exists());
     }
 
     #[tokio::test]
