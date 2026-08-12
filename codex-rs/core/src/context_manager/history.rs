@@ -15,6 +15,7 @@ use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_history::STORE_BACKED_TOOL_OUTPUT_MAX_BYTES;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -195,8 +196,23 @@ impl ContextManager {
                 continue;
             }
 
+            let store_backed =
+                metadata.is_some_and(CodexHarnessMetadata::is_store_backed_tool_output);
             let processed = ResponseItemEnvelope {
-                item: Self::process_item(item, policy),
+                item: if store_backed
+                    && matches!(
+                        item,
+                        ResponseItem::FunctionCallOutput { output, .. }
+                            | ResponseItem::CustomToolCallOutput { output, .. }
+                            if matches!(&output.body, FunctionCallOutputBody::Text(text) if text.len() <= STORE_BACKED_TOOL_OUTPUT_MAX_BYTES)
+                    ) {
+                    item.clone()
+                } else if store_backed {
+                    Self::process_store_backed_content_item(item, policy)
+                        .unwrap_or_else(|| Self::process_item(item, policy))
+                } else {
+                    Self::process_item(item, policy)
+                },
                 metadata: metadata.cloned(),
             };
             Arc::make_mut(&mut self.items).push(processed);
@@ -517,6 +533,66 @@ impl ContextManager {
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => item.clone(),
         }
+    }
+
+    fn process_store_backed_content_item(
+        item: &ResponseItem,
+        policy: TruncationPolicy,
+    ) -> Option<ResponseItem> {
+        let mut item = item.clone();
+        let output = match &mut item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => output,
+            _ => return None,
+        };
+        let FunctionCallOutputBody::ContentItems(items) = &mut output.body else {
+            return None;
+        };
+        let text_bytes = items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text.len()),
+                _ => None,
+            })
+            .try_fold(0usize, usize::checked_add)?;
+        if text_bytes > STORE_BACKED_TOOL_OUTPUT_MAX_BYTES {
+            return None;
+        }
+
+        let policy = policy * 1.2;
+        let text_tokens = items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(approx_token_count(text)),
+                _ => None,
+            })
+            .fold(0usize, usize::saturating_add);
+        let mut configured_remaining = match policy {
+            TruncationPolicy::Bytes(limit) => limit.saturating_sub(text_bytes),
+            TruncationPolicy::Tokens(limit) => limit.saturating_sub(text_tokens),
+        };
+        let mut hard_remaining = STORE_BACKED_TOOL_OUTPUT_MAX_BYTES - text_bytes;
+        items.retain(|item| match item {
+            FunctionCallOutputContentItem::InputAudio { audio_url } => {
+                let tokens = estimate_audio_token_count(audio_url);
+                let hard_cost = approx_bytes_for_tokens(tokens);
+                let configured_cost = match policy {
+                    TruncationPolicy::Bytes(_) => hard_cost,
+                    TruncationPolicy::Tokens(_) => tokens,
+                };
+                if hard_cost <= hard_remaining && configured_cost <= configured_remaining {
+                    hard_remaining -= hard_cost;
+                    configured_remaining -= configured_cost;
+                    true
+                } else {
+                    false
+                }
+            }
+            FunctionCallOutputContentItem::InputText { .. }
+            | FunctionCallOutputContentItem::InputImage { .. }
+            | FunctionCallOutputContentItem::EncryptedContent { .. } => true,
+        });
+        Some(item)
     }
 
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.

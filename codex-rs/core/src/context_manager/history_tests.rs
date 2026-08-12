@@ -1537,6 +1537,109 @@ fn record_items_respects_custom_token_limit() {
     );
 }
 
+#[test]
+fn record_annotated_items_preserves_only_bounded_store_backed_controls() {
+    let make_envelope = |text: String| ResponseItemEnvelope {
+        item: ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-artifact".to_string(),
+            output: FunctionCallOutputPayload::from_text(text),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata::store_backed_tool_output()),
+    };
+    let bounded = make_envelope(format!(
+        "{{\"type\":\"tool_output_artifact\",\"preview\":\"{}\"}}",
+        "x".repeat(512)
+    ));
+    let oversized = make_envelope("x".repeat(STORE_BACKED_TOOL_OUTPUT_MAX_BYTES + 1));
+    let mut history = ContextManager::new();
+
+    history.record_annotated_items(&[bounded.clone(), oversized], TruncationPolicy::Bytes(64));
+
+    assert_eq!(history.items[0], bounded);
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.items[1].item else {
+        panic!("expected function output")
+    };
+    assert!(output.text_content().is_some_and(|text| text.len() < 512));
+}
+
+#[test]
+fn store_backed_mixed_content_still_applies_the_aggregate_output_policy() {
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let envelope = ResponseItemEnvelope {
+        item: ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-artifact-audio".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "{\"type\":\"tool_output_artifact\"}".to_string(),
+                },
+                FunctionCallOutputContentItem::InputAudio { audio_url },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata::store_backed_tool_output()),
+    };
+    let policy = TruncationPolicy::Bytes(64);
+    let mut expected = envelope.item.clone();
+    let ResponseItem::FunctionCallOutput { output, .. } = &mut expected else {
+        unreachable!()
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &mut output.body else {
+        unreachable!()
+    };
+    items.retain(|item| !matches!(item, FunctionCallOutputContentItem::InputAudio { .. }));
+    let mut history = ContextManager::new();
+
+    history.record_annotated_items(std::slice::from_ref(&envelope), policy);
+
+    assert_eq!(history.items[0].item, expected);
+    assert_eq!(history.items[0].metadata, envelope.metadata);
+}
+
+#[test]
+fn store_backed_mixed_control_stays_structurally_valid_under_a_tiny_policy() {
+    let control = serde_json::json!({
+        "type": "tool_output_artifact",
+        "artifact_id": format!("out_{}", "a".repeat(64)),
+        "preview": "x".repeat(512),
+    })
+    .to_string();
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let envelope = ResponseItemEnvelope {
+        item: ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-artifact-audio".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: control.clone(),
+                },
+                FunctionCallOutputContentItem::InputAudio { audio_url },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata::store_backed_tool_output()),
+    };
+    let mut history = ContextManager::new();
+
+    history.record_annotated_items(&[envelope], TruncationPolicy::Bytes(32));
+
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.items[0].item else {
+        panic!("expected function output")
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        panic!("expected content items")
+    };
+    assert_eq!(
+        items,
+        &[FunctionCallOutputContentItem::InputText {
+            text: control.clone(),
+        }]
+    );
+    assert!(serde_json::from_str::<serde_json::Value>(&control).is_ok());
+}
+
 fn assert_truncated_message_matches(message: &str, line: &str, expected_removed: usize) {
     let pattern = truncated_message_pattern(line);
     let regex = Regex::new(&pattern).unwrap_or_else(|err| {
