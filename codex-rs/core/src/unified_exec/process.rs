@@ -30,8 +30,8 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::SpawnedPty;
 
-use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::MAX_RECOVERABLE_EXEC_OUTPUT_BYTES;
+use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;

@@ -873,9 +873,7 @@ mod tests {
                 ],
                 vec![
                     None,
-                    Some(CodexHarnessMetadata {
-                        client_authored: true,
-                    }),
+                    Some(CodexHarnessMetadata::client_authored()),
                     Some(CodexHarnessMetadata::default()),
                     None,
                 ],
@@ -896,9 +894,7 @@ mod tests {
                     0,
                     ResponseItemEnvelope {
                         item: client.clone(),
-                        metadata: Some(CodexHarnessMetadata {
-                            client_authored: true,
-                        }),
+                        metadata: Some(CodexHarnessMetadata::client_authored()),
                     },
                 );
             }

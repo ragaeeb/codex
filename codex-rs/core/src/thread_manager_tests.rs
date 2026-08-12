@@ -1564,7 +1564,9 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
                 },
                 ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: "artifact-call".to_string(),
+                    call_id: Some("artifact-call".to_string()),
+                    name: None,
+                    namespace: None,
                     output: codex_protocol::models::FunctionCallOutputPayload::from_text(
                         inherited_output.clone(),
                     ),

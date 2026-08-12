@@ -7,7 +7,6 @@ use std::collections::VecDeque;
 /// symmetric meaning 50% of the capacity is allocated to the head and 50% is
 /// allocated to the tail.
 #[derive(Debug, Default)]
-#[cfg_attr(test, derive(Eq, PartialEq))]
 pub(crate) struct HeadTailBuffer<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES> {
     head: Vec<u8>,
     tail: VecDeque<u8>,
@@ -16,6 +15,18 @@ pub(crate) struct HeadTailBuffer<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MA
     complete: Option<Vec<u8>>,
     capture_limit_exceeded: bool,
 }
+
+#[cfg(test)]
+impl<const MAX_BYTES: usize> PartialEq for HeadTailBuffer<MAX_BYTES> {
+    fn eq(&self, other: &Self) -> bool {
+        self.head == other.head
+            && self.tail == other.tail
+            && self.omitted_bytes == other.omitted_bytes
+    }
+}
+
+#[cfg(test)]
+impl<const MAX_BYTES: usize> Eq for HeadTailBuffer<MAX_BYTES> {}
 
 impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
     const HEAD_BUDGET: usize = MAX_BYTES / 2;
@@ -73,11 +84,11 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
                 self.capture_limit_exceeded = true;
             }
         }
-        let chunk = self.fill_head(chunk);
-        self.push_tail(chunk);
+        self.push_preview_chunk(chunk);
     }
 
     /// Snapshot the retained output as head and tail chunks.
+    #[allow(dead_code)]
     pub(crate) fn snapshot_chunks(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(2);
         if !self.head.is_empty() {
@@ -95,6 +106,7 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
             head,
             tail: _,
             omitted_bytes: _,
+            ..
         } = self;
 
         let remaining_head = Self::HEAD_BUDGET.saturating_sub(head.len());
@@ -106,12 +118,18 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
         chunk_tail
     }
 
+    fn push_preview_chunk(&mut self, chunk: &[u8]) {
+        let chunk = self.fill_head(chunk);
+        self.push_tail(chunk);
+    }
+
     /// Append bytes known not to belong in the head, keeping the newest tail bytes.
     fn push_tail(&mut self, chunk: &[u8]) {
         let Self {
             head: _,
             tail,
             omitted_bytes,
+            ..
         } = self;
 
         let remaining_tail = Self::TAIL_BUDGET.saturating_sub(tail.len());
@@ -167,16 +185,12 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
 
     /// Append a later buffer with the same budget. This preserves the summary
     /// of the original concatenated output, including its omission count.
-    pub(crate) fn push_buffer(&mut self, buffer: Self) {
-        let captured = match (
-            self.capture_limit,
-            &mut self.complete,
-            buffer.complete.as_ref(),
-        ) {
+    pub(crate) fn push_buffer(&mut self, mut buffer: Self) {
+        let captured = match (self.capture_limit, &mut self.complete, &mut buffer.complete) {
             (Some(limit), Some(destination), Some(source))
                 if destination.len().saturating_add(source.len()) <= limit =>
             {
-                destination.extend_from_slice(source);
+                destination.append(source);
                 true
             }
             _ => false,
@@ -194,35 +208,11 @@ impl<const MAX_BYTES: usize> HeadTailBuffer<MAX_BYTES> {
             ..
         } = buffer;
 
+        self.push_preview_chunk(&head);
+        let (first, second) = tail.as_slices();
+        self.push_preview_chunk(first);
+        self.push_preview_chunk(second);
         self.omitted_bytes = self.omitted_bytes.saturating_add(omitted_bytes);
-
-        // Preserve an existing prefix; otherwise reuse the source head.
-        let overflow = if self.head.is_empty() {
-            self.head = head;
-            &[]
-        } else {
-            self.fill_head(&head)
-        };
-
-        // A full source tail displaces both the old tail and the unused source head.
-        if tail.len() == Self::TAIL_BUDGET {
-            self.omitted_bytes = self
-                .omitted_bytes
-                .saturating_add(self.tail.len())
-                .saturating_add(overflow.len());
-            self.tail = tail;
-        } else {
-            self.push_tail(overflow);
-            // An empty destination can take a partial source tail without copying it.
-            if self.tail.is_empty() {
-                self.tail = tail;
-            } else {
-                // A nonempty source tail means its head, and now ours, is full.
-                let (first, second) = tail.as_slices();
-                self.push_tail(first);
-                self.push_tail(second);
-            }
-        }
     }
 
     /// Drain the retained output and capture metadata while preserving the configured limits.

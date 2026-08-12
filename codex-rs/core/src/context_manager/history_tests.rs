@@ -1542,7 +1542,9 @@ fn record_annotated_items_preserves_only_bounded_store_backed_controls() {
     let make_envelope = |text: String| ResponseItemEnvelope {
         item: ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-artifact".to_string(),
+            call_id: Some("call-artifact".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text(text),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1570,7 +1572,9 @@ fn store_backed_mixed_content_still_applies_the_aggregate_output_policy() {
     let envelope = ResponseItemEnvelope {
         item: ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-artifact-audio".to_string(),
+            call_id: Some("call-artifact-audio".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "{\"type\":\"tool_output_artifact\"}".to_string(),
@@ -1610,7 +1614,9 @@ fn store_backed_mixed_control_stays_structurally_valid_under_a_tiny_policy() {
     let envelope = ResponseItemEnvelope {
         item: ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-artifact-audio".to_string(),
+            call_id: Some("call-artifact-audio".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: control.clone(),

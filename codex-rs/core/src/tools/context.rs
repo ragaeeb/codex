@@ -511,28 +511,15 @@ impl ExecCommandToolOutput {
             return envelope.to_string();
         }
         let header = self.response_header();
-        let output_budget = (self.truncation_policy * 1.2)
-            .byte_budget()
-            .saturating_sub(header.len().saturating_add(/*rhs*/ 1));
-        let mut policy = self.model_output_policy();
-        let mut output = self.truncated_output_with_policy(policy);
-
-        // History applies this same serialization budget to the complete response.
-        // Reserve room for metadata, warning headers, and the truncation marker so
-        // it does not truncate an already-truncated output a second time.
-        while output.len() > output_budget && policy.byte_budget() > 0 {
-            let excess_bytes = output.len() - output_budget;
-            policy = match policy {
-                TruncationPolicy::Bytes(bytes) => {
-                    TruncationPolicy::Bytes(bytes.saturating_sub(excess_bytes))
+        let output = match self.max_output_tokens {
+            Some(max_tokens) => self.truncated_output(max_tokens),
+            None => match self.output_omitted_bytes {
+                Some(omitted) if !raw.contains(&format_output_omission_marker(omitted.get())) => {
+                    format!("{}\n{raw}", format_output_omission_marker(omitted.get()))
                 }
-                TruncationPolicy::Tokens(tokens) => TruncationPolicy::Tokens(
-                    tokens.saturating_sub(TruncationPolicy::Bytes(excess_bytes).token_budget()),
-                ),
-            };
-            output = self.truncated_output_with_policy(policy);
-        }
-
+                Some(_) | None => raw,
+            },
+        };
         format!("{header}\n{output}")
     }
 }

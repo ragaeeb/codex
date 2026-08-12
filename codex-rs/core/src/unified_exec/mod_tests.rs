@@ -9,6 +9,7 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
@@ -329,7 +330,7 @@ async fn write_stdin(
 
 #[test]
 fn push_chunk_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
+    let mut buffer = HeadTailBuffer::<UNIFIED_EXEC_OUTPUT_MAX_BYTES>::default();
     buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
     buffer.push_chunk(vec![b'b']);
     buffer.push_chunk(vec![b'c']);
@@ -389,9 +390,7 @@ async fn oversized_shell_output_spills_complete_capture() {
 #[tokio::test]
 async fn recoverable_shell_capture_falls_back_at_its_hard_quota() {
     let (session, turn) = test_session_and_turn().await;
-    let mut buffer = HeadTailBuffer::new_recoverable(
-        MAX_RECOVERABLE_EXEC_OUTPUT_BYTES,
-    );
+    let mut buffer = HeadTailBuffer::new_recoverable(MAX_RECOVERABLE_EXEC_OUTPUT_BYTES);
     buffer.push_chunk(vec![b'x'; MAX_RECOVERABLE_EXEC_OUTPUT_BYTES + 1]);
 
     let (output, omitted, artifact) = recoverable_output(
@@ -410,7 +409,7 @@ async fn recoverable_shell_capture_falls_back_at_its_hard_quota() {
 
 #[test]
 fn head_tail_buffer_default_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
+    let mut buffer = HeadTailBuffer::<UNIFIED_EXEC_OUTPUT_MAX_BYTES>::default();
     buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
     buffer.push_chunk(b"bc".to_vec());
 

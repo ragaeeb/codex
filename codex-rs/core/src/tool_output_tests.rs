@@ -27,7 +27,9 @@ fn artifact_store(base: &std::path::Path) -> OutputArtifactStore {
 fn item(body: FunctionCallOutputBody) -> ResponseItem {
     ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-1".into(),
+        call_id: Some("call-1".into()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload {
             body,
             success: Some(true),

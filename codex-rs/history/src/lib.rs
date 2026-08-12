@@ -65,6 +65,14 @@ enum ToolOutputProvenance {
 }
 
 impl CodexHarnessMetadata {
+    /// Marks a developer message supplied by an app-server client.
+    pub fn client_authored() -> Self {
+        Self {
+            client_authored: true,
+            ..Default::default()
+        }
+    }
+
     /// Marks a bounded tool-output control document whose artifact was verified
     /// in the managed store by the harness.
     pub fn store_backed_tool_output() -> Self {

@@ -2144,7 +2144,10 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
         .map(|tool| tool["name"].as_str().expect("guardian code-mode tool name"))
         .collect::<Vec<_>>();
     guardian_tool_names.sort_unstable();
-    assert_eq!(guardian_tool_names, vec!["exec", "wait"]);
+    assert_eq!(
+        guardian_tool_names,
+        vec!["exec", "read_tool_output", "wait"]
+    );
 
     let guardian_exec_description = guardian_tools
         .iter()
@@ -2159,7 +2162,7 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     guardian_nested_tool_names.sort_unstable();
     assert_eq!(
         guardian_nested_tool_names,
-        vec!["exec_command", "read_tool_output", "view_image", "write_stdin"]
+        vec!["exec_command", "view_image", "write_stdin"]
     );
     let guardian_user_text = request.message_input_texts("user").join("\n");
     assert!(

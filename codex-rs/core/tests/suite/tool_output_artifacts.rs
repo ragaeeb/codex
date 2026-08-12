@@ -1,10 +1,10 @@
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -74,16 +74,10 @@ async fn oversized_output_is_recoverable_persisted_once_and_survives_resume() ->
         .context("rollout path")?;
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "produce a large result".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "produce a large result".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     let mut raw_text = None;
     loop {
@@ -98,7 +92,7 @@ async fn oversized_output_is_recoverable_persisted_once_and_survives_resume() ->
                 if let ResponseItem::FunctionCallOutput {
                     call_id, output, ..
                 } = raw.item
-                    && call_id == "large-output"
+                    && call_id.as_deref() == Some("large-output")
                     && let FunctionCallOutputBody::Text(text) = output.body
                 {
                     raw_text = Some(text);

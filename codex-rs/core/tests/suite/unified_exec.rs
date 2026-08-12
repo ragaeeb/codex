@@ -3775,4 +3775,3 @@ fn assert_command(command: &[String], expected_args: &str, expected_cmd: &str) {
     assert_eq!(command[1], expected_args);
     assert_eq!(command[2], expected_cmd);
 }
-

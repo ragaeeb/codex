@@ -70,9 +70,7 @@ impl Session {
     pub(crate) fn annotate_client_response_item(&self, item: ResponseItem) -> ResponseItemEnvelope {
         let metadata = (self.enabled(Feature::RetainClientDeveloperMessages)
             && matches!(&item, ResponseItem::Message { role, .. } if role == "developer"))
-        .then_some(CodexHarnessMetadata {
-            client_authored: true,
-        });
+        .then(CodexHarnessMetadata::client_authored);
 
         ResponseItemEnvelope { item, metadata }
     }
@@ -110,8 +108,17 @@ impl Session {
                 }
             }));
         }
-        self.record_prepared_conversation_items(turn_context, annotated_items, image_preparations)
-            .await;
+        let response_items = annotated_items
+            .iter()
+            .map(|envelope| envelope.item.clone())
+            .collect();
+        self.record_prepared_conversation_items(
+            turn_context,
+            annotated_items,
+            response_items,
+            image_preparations,
+        )
+        .await;
     }
 
     /// Injects items into active work, or records them without starting a turn.

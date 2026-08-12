@@ -13,7 +13,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::TempDirExt;
 use core_test_support::assert_regex_match;
@@ -305,12 +304,13 @@ async fn tool_call_output_truncated_only_once() -> Result<()> {
         .function_call_output_text(call_id)
         .context("function_call_output present for shell call")?;
 
-    let truncation_markers = output.matches("tokens truncated").count();
-
-    assert_eq!(
-        truncation_markers, 1,
-        "shell output should carry only one truncation marker: {output}"
+    let artifact = output_artifact(&output);
+    assert!(
+        artifact["original_lines"]
+            .as_u64()
+            .is_some_and(|lines| lines >= 10_000)
     );
+    assert_eq!(output.matches("tokens truncated").count(), 0);
 
     Ok(())
 }

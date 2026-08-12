@@ -395,9 +395,7 @@ mod tests {
 
         let annotated = TurnInput::ResponseItem(ResponseItemEnvelope {
             item: ResponseItem::Other,
-            metadata: Some(CodexHarnessMetadata {
-                client_authored: true,
-            }),
+            metadata: Some(CodexHarnessMetadata::client_authored()),
         });
         assert!(serde_json::to_value(annotated).is_err());
 

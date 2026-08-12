@@ -73,7 +73,10 @@ fn draining_preserves_complete_capture_for_push_buffer() {
     assert_eq!(buf.omitted_bytes(), 0);
     assert_eq!(collected.to_bytes(), b"01234789ab");
     assert_eq!(collected.omitted_bytes(), 2);
-    assert_eq!(collected.take_complete_bytes(), Some(b"0123456789ab".to_vec()));
+    assert_eq!(
+        collected.take_complete_bytes(),
+        Some(b"0123456789ab".to_vec())
+    );
 }
 
 #[test]

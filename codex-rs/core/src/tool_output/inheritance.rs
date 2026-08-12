@@ -30,6 +30,7 @@ pub(crate) fn referenced_output_artifact_ids(history: &InitialHistory) -> Vec<Ou
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => {}
         }
     }

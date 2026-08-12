@@ -1368,9 +1368,8 @@ impl UnifiedExecProcessManager {
             output_closed_notify,
             cancellation_token,
         } = output;
-        let mut collected = HeadTailBuffer::new_recoverable(
-            super::MAX_RECOVERABLE_EXEC_OUTPUT_BYTES,
-        );
+        let mut collected =
+            HeadTailBuffer::new_recoverable(super::MAX_RECOVERABLE_EXEC_OUTPUT_BYTES);
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
         loop {

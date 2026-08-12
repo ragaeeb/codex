@@ -116,6 +116,7 @@ impl ToolCallRuntime {
         let router = &self.step_context.tool_router;
         let supports_parallel = router.tool_supports_parallel(&call);
         let tool_runtime = router.tool_runtime(&call);
+        let wait_for_runtime_cancellation = router.tool_waits_for_runtime_cancellation(&call);
         let router = Arc::clone(router);
         let session = Arc::clone(&self.session);
         let step_context = Arc::clone(&self.step_context);
@@ -188,11 +189,24 @@ impl ToolCallRuntime {
                     } else {
                         let secs = started.elapsed().as_secs_f32().max(0.1);
                         abort_dispatch_span.record("aborted", true);
-                        dispatch_handle.abort();
-                        match dispatch_handle.await {
-                            Ok(result) => return result,
-                            Err(err) if err.is_cancelled() => {}
-                            Err(err) => return Err(Self::tool_task_join_error(err)),
+                        if wait_for_runtime_cancellation {
+                            if terminal_outcome_reached.swap(true, Ordering::AcqRel) {
+                                return dispatch_handle.await.map_err(Self::tool_task_join_error)?;
+                            }
+                            // The abort owns the terminal outcome; await only so
+                            // the runtime can finish process teardown.
+                            match dispatch_handle.await {
+                                Ok(_) => {}
+                                Err(err) if err.is_cancelled() => {}
+                                Err(err) => return Err(Self::tool_task_join_error(err)),
+                            }
+                        } else {
+                            dispatch_handle.abort();
+                            match dispatch_handle.await {
+                                Ok(result) => return result,
+                                Err(err) if err.is_cancelled() => {}
+                                Err(err) => return Err(Self::tool_task_join_error(err)),
+                            }
                         }
                         let response = Self::aborted_response(&call, secs);
                         notify_tool_aborted(
@@ -552,6 +566,90 @@ mod tests {
     }
 
     impl CoreToolRuntime for ImmediateHandler {}
+
+    struct CancellationCleanupHandler {
+        tool_name: codex_tools::ToolName,
+        started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        cleanup_started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        allow_cleanup: Arc<Notify>,
+    }
+
+    impl ToolExecutor<ToolInvocation> for CancellationCleanupHandler {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            self.tool_name.clone()
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: self.tool_name.name.clone(),
+                description: "Cancellation cleanup test tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })
+        }
+
+        fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(self.handle_call(invocation))
+        }
+    }
+
+    impl CancellationCleanupHandler {
+        async fn handle_call(
+            &self,
+            invocation: ToolInvocation,
+        ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+            let started = self
+                .started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            invocation.cancellation_token.cancelled().await;
+            let cleanup_started = self
+                .cleanup_started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(cleanup_started) = cleanup_started {
+                let _ = cleanup_started.send(());
+            }
+            self.allow_cleanup.notified().await;
+            Ok(Box::new(FunctionToolOutput::from_text(
+                "cleanup complete".to_string(),
+                Some(false),
+            )) as Box<dyn crate::tools::context::ToolOutput>)
+        }
+    }
+
+    impl CoreToolRuntime for CancellationCleanupHandler {
+        fn waits_for_runtime_cancellation(&self) -> bool {
+            true
+        }
+    }
+
+    struct FinishRecorder {
+        records: Arc<std::sync::Mutex<Vec<ToolCallOutcome>>>,
+    }
+
+    impl codex_extension_api::ToolLifecycleContributor for FinishRecorder {
+        fn on_tool_finish<'a>(
+            &'a self,
+            input: codex_extension_api::ToolFinishInput<'a>,
+        ) -> codex_extension_api::ToolLifecycleFuture<'a> {
+            let records = Arc::clone(&self.records);
+            let outcome = input.outcome;
+            Box::pin(async move {
+                records
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(outcome);
+            })
+        }
+    }
 
     struct BlockingFinishContributor {
         records: Arc<std::sync::Mutex<Vec<ToolCallOutcome>>>,
