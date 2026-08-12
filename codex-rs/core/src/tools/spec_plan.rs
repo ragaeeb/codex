@@ -21,6 +21,7 @@ use crate::tools::handlers::ListMcpResourcesHandler;
 use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
+use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
@@ -888,9 +889,10 @@ fn code_mode_namespace_descriptions(
 
 #[instrument(level = "trace", skip_all)]
 fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
-    // Guardian reviewers receive only `exec_command`, `write_stdin`, and `view_image`
-    // when a managed sandbox can enforce the parent's filesystem restrictions;
-    // all general tool sources stay excluded.
+    registry.add(ReadToolOutputHandler);
+    // Guardian reviewers receive only `exec_command`, `write_stdin`, `view_image`, and
+    // `read_tool_output` when a managed sandbox can enforce the parent's filesystem restrictions;
+    // all other general tool sources stay excluded.
     if crate::guardian::is_basic_session_source(&context.turn_context.session_source) {
         let turn_context = context.turn_context;
         if !matches!(

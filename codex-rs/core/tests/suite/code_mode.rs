@@ -161,6 +161,10 @@ fn text_item(items: &[Value], index: usize) -> &str {
         .expect("content item should be input_text")
 }
 
+fn artifact_item(items: &[Value], index: usize) -> Value {
+    serde_json::from_str(text_item(items, index)).expect("tool output artifact")
+}
+
 fn extract_running_cell_id(text: &str) -> String {
     text.strip_prefix("Script running with cell ID ")
         .and_then(|rest| rest.split('\n').next())
@@ -841,6 +845,7 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
         vec![
             "exec".to_string(),
             "wait".to_string(),
+            "read_tool_output".to_string(),
             "request_user_input".to_string(),
             "web_search".to_string()
         ]
@@ -1282,6 +1287,7 @@ if (!tool) {
         vec![
             "exec".to_string(),
             "wait".to_string(),
+            "read_tool_output".to_string(),
             "request_user_input".to_string(),
             "web_search".to_string()
         ]
@@ -1720,15 +1726,14 @@ text(JSON.stringify([results[0].output.includes("code-alpha-ready"), results[1].
     Ok(())
 }
 
-// This model uses token-based tool-output truncation, giving the downstream
-// history assertions a stable `…N tokens truncated…` marker.
+// This model uses token-based tool-output limits for deterministic spill thresholds.
 const TOKEN_POLICY_TEST_MODEL: &str = "gpt-5.4";
 
 // A nested `exec_command` limit applies to `result.output` inside JavaScript.
 // The outer code-mode and history budgets apply after the script calls `text`.
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> Result<()> {
+async fn code_mode_exec_nested_limit_returns_recoverable_artifact() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1745,13 +1750,10 @@ text(result.output);
     )
     .await?;
 
-    assert_eq!(
-        text_item(
-            &custom_tool_output_items(&second_mock.single_request(), "call-1"),
-            /*index*/ 1
-        ),
-        "Warning: truncated output (original token count: 10)\nTotal output lines: 1\n\n0123456789…5 tokens truncated…0123456789"
-    );
+    let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
+    let artifact = artifact_item(&items, /*index*/ 1);
+    assert_eq!(artifact["type"], "tool_output_artifact");
+    assert_eq!(artifact["original_bytes"], 40);
 
     Ok(())
 }
@@ -1785,10 +1787,9 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     .await?;
 
     let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
+    assert_eq!(
+        artifact_item(&items, /*index*/ 1)["type"],
+        "tool_output_artifact"
     );
 
     Ok(())
@@ -1796,7 +1797,7 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_exec_nested_limit_truncates_result_variable_when_exceeded() -> Result<()> {
+async fn code_mode_exec_nested_limit_spills_result_variable_when_exceeded() -> Result<()> {
     // TODO(anp): Remove after Wine exec returns complete nested-tool output to code mode.
     skip_if_wine_exec!(
         Ok(()),
@@ -1822,19 +1823,12 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     .await?;
 
     let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
-    // The nested 20,000-token budget leaves about 80,000 characters. This
-    // ceiling independently proves that history applied its smaller cap.
-    assert!(
-        output.len() < 60_000,
-        "expected history to truncate the emitted value, got {} bytes",
-        output.len()
-    );
-    // The boolean describes the nested result; the marker below comes from
-    // history truncating the value emitted with `text` afterward.
-    assert_regex_match(
-        r"(?s)^Variable truncated: True\. Variable: .*…\d+ tokens truncated…A+$",
-        output,
+    let artifact = text_item(&items, /*index*/ 1)
+        .strip_prefix("Variable truncated: False. Variable: ")
+        .expect("embedded artifact");
+    assert_eq!(
+        serde_json::from_str::<Value>(artifact)?["type"],
+        "tool_output_artifact"
     );
 
     Ok(())
@@ -1871,17 +1865,12 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     .await?;
 
     let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
-    // The 50-token override must shrink this 50,000-character value far below
-    // what the default 10,000-token history cap would retain.
+    let artifact = artifact_item(&items, /*index*/ 1);
+    assert_eq!(artifact["type"], "tool_output_artifact");
     assert!(
-        output.len() < 1_000,
-        "expected configured history cap to truncate the emitted value, got {} bytes",
-        output.len()
-    );
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
+        artifact["original_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 50_000)
     );
 
     Ok(())
@@ -1915,11 +1904,8 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     .await?;
 
     let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
-    );
+    let artifact = artifact_item(&items, /*index*/ 1);
+    assert_eq!(artifact["type"], "tool_output_artifact");
 
     Ok(())
 }
@@ -1954,18 +1940,8 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     .await?;
 
     let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
-    // The 50-token override must shrink this 50,000-character value far below
-    // what the default 10,000-token history cap would retain.
-    assert!(
-        output.len() < 1_000,
-        "expected configured history cap to truncate the emitted value, got {} bytes",
-        output.len()
-    );
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
-    );
+    let artifact = artifact_item(&items, /*index*/ 1);
+    assert_eq!(artifact["type"], "tool_output_artifact");
 
     Ok(())
 }
