@@ -799,6 +799,9 @@
             "multi_agent_v2": {
               "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
             },
+            "native_read_file": {
+              "type": "boolean"
+            },
             "network_proxy": {
               "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
             },
@@ -5821,6 +5824,9 @@
         "multi_agent_v2": {
           "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
         },
+        "native_read_file": {
+          "type": "boolean"
+        },
         "network_proxy": {
           "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
         },
@@ -6420,6 +6426,7 @@
       "type": "boolean"
     },
     "tool_output_token_limit": {
+      "default": null,
       "description": "Token budget applied when storing tool/function outputs in the context manager.",
       "format": "uint",
       "minimum": 0.0,

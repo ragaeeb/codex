@@ -1530,10 +1530,11 @@ fn record_items_respects_custom_token_limit() {
         ResponseItem::FunctionCallOutput { output, .. } => output,
         other => panic!("unexpected history item: {other:?}"),
     };
-    assert!(
-        stored
-            .text_content()
-            .is_some_and(|content| content.contains("tokens truncated"))
+    let text = stored.text_content().expect("bounded tool output text");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text)
+            .expect("low-budget fallback remains structured JSON")["type"],
+        "tool_output_error"
     );
 }
 
@@ -1550,20 +1551,35 @@ fn record_annotated_items_preserves_only_bounded_store_backed_controls() {
         },
         metadata: Some(CodexHarnessMetadata::store_backed_tool_output()),
     };
-    let bounded = make_envelope(format!(
-        "{{\"type\":\"tool_output_artifact\",\"preview\":\"{}\"}}",
-        "x".repeat(512)
-    ));
+    let bounded_text = serde_json::json!({
+        "type": "tool_output_artifact",
+        "artifact_id": format!("out_{}", "a".repeat(64)),
+        "preview": {"head": "x".repeat(512), "tail": "x".repeat(512)},
+        "retrieval": "Use read_tool_output with this artifact_id."
+    })
+    .to_string();
+    let bounded = make_envelope(bounded_text.clone());
     let oversized = make_envelope("x".repeat(STORE_BACKED_TOOL_OUTPUT_MAX_BYTES + 1));
     let mut history = ContextManager::new();
 
-    history.record_annotated_items(&[bounded.clone(), oversized], TruncationPolicy::Bytes(64));
+    history.record_annotated_items(&[bounded, oversized], TruncationPolicy::Bytes(256));
 
-    assert_eq!(history.items[0], bounded);
+    let expected_bounded = compact_store_backed_envelope(&bounded_text, /*max_bytes*/ 256)
+        .expect("the compact artifact handle should fit the policy");
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.items[0].item else {
+        panic!("expected function output")
+    };
+    assert_eq!(output.text_content(), Some(expected_bounded.as_str()));
+    assert_eq!(
+        history.items[0].metadata,
+        Some(CodexHarnessMetadata::store_backed_tool_output())
+    );
     let ResponseItem::FunctionCallOutput { output, .. } = &history.items[1].item else {
         panic!("expected function output")
     };
-    assert!(output.text_content().is_some_and(|text| text.len() < 512));
+    let text = output.text_content().expect("bounded fallback");
+    assert!(text.len() <= 256);
+    assert!(serde_json::from_str::<serde_json::Value>(text).is_ok());
 }
 
 #[test]
@@ -1577,7 +1593,10 @@ fn store_backed_mixed_content_still_applies_the_aggregate_output_policy() {
             namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
-                    text: "{\"type\":\"tool_output_artifact\"}".to_string(),
+                    text: format!(
+                        "{{\"type\":\"tool_output_artifact\",\"artifact_id\":\"out_{}\"}}",
+                        "a".repeat(64)
+                    ),
                 },
                 FunctionCallOutputContentItem::InputAudio { audio_url },
             ]),
@@ -1585,7 +1604,7 @@ fn store_backed_mixed_content_still_applies_the_aggregate_output_policy() {
         },
         metadata: Some(CodexHarnessMetadata::store_backed_tool_output()),
     };
-    let policy = TruncationPolicy::Bytes(64);
+    let policy = TruncationPolicy::Bytes(256);
     let mut expected = envelope.item.clone();
     let ResponseItem::FunctionCallOutput { output, .. } = &mut expected else {
         unreachable!()
@@ -1600,6 +1619,56 @@ fn store_backed_mixed_content_still_applies_the_aggregate_output_policy() {
 
     assert_eq!(history.items[0].item, expected);
     assert_eq!(history.items[0].metadata, envelope.metadata);
+}
+
+#[test]
+fn store_backed_content_items_apply_modality_and_count_bounds() {
+    let control = format!(
+        r#"{{"type":"tool_output_artifact","artifact_id":"out_{}"}}"#,
+        "a".repeat(64)
+    );
+    let envelope = ResponseItemEnvelope {
+        item: ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("call-artifact-images".to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputText { text: control },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: format!("data:image/png;base64,{}", "a".repeat(16_000)),
+                    detail: None,
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: format!("data:image/png;base64,{}", "b".repeat(16_000)),
+                    detail: None,
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata::store_backed_tool_output()),
+    };
+    let mut history = ContextManager::new();
+    history.record_annotated_items(
+        std::slice::from_ref(&envelope),
+        TruncationPolicy::Bytes(8 * 1024),
+    );
+
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.items[0].item else {
+        panic!("expected function output");
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        panic!("store-backed mixed output should remain structured");
+    };
+    assert!(items.len() <= 64);
+    assert!(items.iter().any(|item| {
+        matches!(item, FunctionCallOutputContentItem::InputText { text }
+            if text.contains("omitted media content"))
+    }));
+    assert_eq!(
+        history.items[0].metadata,
+        Some(CodexHarnessMetadata::store_backed_tool_output())
+    );
 }
 
 #[test]
@@ -1618,9 +1687,7 @@ fn store_backed_mixed_control_stays_structurally_valid_under_a_tiny_policy() {
             name: None,
             namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
-                FunctionCallOutputContentItem::InputText {
-                    text: control.clone(),
-                },
+                FunctionCallOutputContentItem::InputText { text: control },
                 FunctionCallOutputContentItem::InputAudio { audio_url },
             ]),
             internal_chat_message_metadata_passthrough: None,
@@ -1634,16 +1701,17 @@ fn store_backed_mixed_control_stays_structurally_valid_under_a_tiny_policy() {
     let ResponseItem::FunctionCallOutput { output, .. } = &history.items[0].item else {
         panic!("expected function output")
     };
+    let bounded_control = bounded_structured_error(/*max_bytes*/ 32);
     let FunctionCallOutputBody::ContentItems(items) = &output.body else {
-        panic!("expected content items")
+        panic!("expected a bounded content-item fallback")
     };
-    assert_eq!(
-        items,
-        &[FunctionCallOutputContentItem::InputText {
-            text: control.clone(),
-        }]
-    );
-    assert!(serde_json::from_str::<serde_json::Value>(&control).is_ok());
+    assert_eq!(items.len(), 1);
+    let FunctionCallOutputContentItem::InputText { text } = &items[0] else {
+        panic!("expected the bounded structured error control")
+    };
+    assert_eq!(text, &bounded_control);
+    assert!(serde_json::from_str::<serde_json::Value>(text).is_ok());
+    assert_eq!(history.items[0].metadata, None);
 }
 
 fn assert_truncated_message_matches(message: &str, line: &str, expected_removed: usize) {
@@ -2546,7 +2614,79 @@ fn record_items_omits_audio_that_exceeds_the_output_budget() {
 }
 
 #[test]
-fn non_base64_image_urls_are_unchanged() {
+fn record_items_caps_content_item_count_and_modality_cost() {
+    let count_limited = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("call-encrypted".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload::from_content_items(
+            (0..65)
+                .map(|_| FunctionCallOutputContentItem::EncryptedContent {
+                    encrypted_content: "encrypted".repeat(100),
+                })
+                .collect(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let modality_limited = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("call-images".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url: format!("data:image/png;base64,{}", "a".repeat(16_000)),
+                detail: None,
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: format!("data:image/png;base64,{}", "b".repeat(16_000)),
+                detail: None,
+            },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = ContextManager::new();
+    history.record_items(
+        [&count_limited, &modality_limited],
+        TruncationPolicy::Bytes(8 * 1024),
+    );
+
+    let items = raw_items(&history);
+    for item in items {
+        let ResponseItem::FunctionCallOutput { output, .. } = item else {
+            panic!("expected function output");
+        };
+        let FunctionCallOutputBody::ContentItems(content) = output.body else {
+            panic!("content-item output should remain structured");
+        };
+        assert!(content.len() <= 64);
+        assert!(content.iter().any(|item| {
+            matches!(item, FunctionCallOutputContentItem::InputText { text }
+                if text.contains("omitted media content"))
+        }));
+    }
+}
+
+#[test]
+fn record_items_keeps_small_output_under_a_low_policy() {
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("call-small".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload::from_text("ok".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = ContextManager::new();
+
+    history.record_items([&item], TruncationPolicy::Bytes(128));
+
+    assert_eq!(raw_items(&history), &[item]);
+}
+
+#[test]
+fn non_base64_image_urls_use_modality_estimates() {
     let message_item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -2573,11 +2713,12 @@ fn non_base64_image_urls_are_unchanged() {
 
     assert_eq!(
         estimate_response_item_model_visible_bytes(&message_item),
-        serde_json::to_string(&message_item).unwrap().len() as i64
+        serde_json::to_string(&message_item).unwrap().len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE
     );
     assert_eq!(
         estimate_response_item_model_visible_bytes(&function_output_item),
         serde_json::to_string(&function_output_item).unwrap().len() as i64
+            + RESIZED_IMAGE_BYTES_ESTIMATE
     );
 }
 
@@ -2623,7 +2764,7 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
 }
 
 #[test]
-fn data_url_without_base64_marker_is_unchanged() {
+fn image_data_url_without_base64_marker_uses_modality_estimate() {
     let item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -2637,7 +2778,7 @@ fn data_url_without_base64_marker_is_unchanged() {
 
     assert_eq!(
         estimate_response_item_model_visible_bytes(&item),
-        serde_json::to_string(&item).unwrap().len() as i64
+        serde_json::to_string(&item).unwrap().len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE
     );
 }
 
@@ -2826,6 +2967,79 @@ fn original_detail_webp_images_scale_with_dimensions() {
     let expected = raw_len - payload.len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
 
     assert_eq!(estimated, expected);
+}
+
+#[test]
+fn remote_original_images_use_the_hard_modality_estimate() {
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("remote-original-image".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "https://example.test/large-original.png".to_string(),
+                detail: Some(ImageDetail::Original),
+            },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = ContextManager::new();
+    history.record_items([&item], TruncationPolicy::Bytes(8 * 1024));
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.items[0].item else {
+        panic!("expected function output");
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        panic!("expected bounded content items");
+    };
+    assert!(!items.iter().any(|item| {
+        matches!(item, FunctionCallOutputContentItem::InputImage { image_url, .. }
+            if image_url.contains("large-original"))
+    }));
+    assert!(items.iter().any(|item| {
+        matches!(item, FunctionCallOutputContentItem::InputText { text }
+            if text.contains("omitted media content"))
+    }));
+}
+
+#[test]
+fn multiple_remote_resized_images_use_the_aggregate_modality_budget() {
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("remote-resized-images".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "https://example.test/first.png".to_string(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "https://example.test/second.png".to_string(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = ContextManager::new();
+    history.record_items([&item], TruncationPolicy::Bytes(8 * 1024));
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.items[0].item else {
+        panic!("expected function output");
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        panic!("expected bounded content items");
+    };
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, FunctionCallOutputContentItem::InputImage { .. }))
+            .count(),
+        1
+    );
+    assert!(items.iter().any(|item| {
+        matches!(item, FunctionCallOutputContentItem::InputText { text }
+            if text.contains("omitted media content"))
+    }));
 }
 
 #[test]

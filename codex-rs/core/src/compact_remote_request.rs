@@ -9,15 +9,19 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_rollout_trace::CompactionTraceContext;
+use codex_utils_output_truncation::OutputArtifactId;
 use tracing::info;
 
 pub(super) struct RemoteCompactAttempt {
     pub(super) new_history: Vec<ResponseItem>,
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
+    pub(super) store_backed_history: Vec<ResponseItemEnvelope>,
+    pub(super) artifact_reference_ids: Vec<OutputArtifactId>,
 }
 
 pub(super) async fn run_remote_compact_attempt(
@@ -31,6 +35,13 @@ pub(super) async fn run_remote_compact_attempt(
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
+    // Capture trusted artifact controls before context-pressure rewriting. The rewrite is
+    // intentionally allowed to replace large outputs with a generic marker, but doing so before
+    // this snapshot would erase the only recoverable handle from legacy remote compaction.
+    let store_backed_history =
+        crate::tool_output::artifact_controls_for_compaction(history.annotated_items());
+    let artifact_reference_ids =
+        crate::tool_output::referenced_output_artifact_ids(history.annotated_items());
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
             &mut history,
@@ -99,5 +110,7 @@ pub(super) async fn run_remote_compact_attempt(
     Ok(RemoteCompactAttempt {
         new_history,
         trace_input_history,
+        store_backed_history,
+        artifact_reference_ids,
     })
 }

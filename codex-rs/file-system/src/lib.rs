@@ -1,4 +1,6 @@
 mod find_up;
+pub mod read_file_snapshot;
+pub mod read_file_window;
 
 use bytes::Bytes;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -490,6 +492,35 @@ pub trait ExecutorFileSystem: Send + Sync {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
+
+    /// Reads a file as a stream beginning at `offset` bytes from the start.
+    ///
+    /// Implementations that can seek efficiently must override this method.
+    /// The default only preserves the offset-zero API; it rejects nonzero
+    /// offsets so a bounded read cannot accidentally trigger an unbounded scan.
+    fn read_file_stream_from<'a>(
+        &'a self,
+        path: &'a PathUri,
+        offset: u64,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async move {
+            if offset != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem does not support efficient offset reads",
+                ));
+            }
+            self.read_file_stream(path, sandbox).await
+        })
+    }
+
+    /// Reports whether nonzero streamed reads are implemented as efficient seeks by this
+    /// filesystem. Implementations that override [`Self::read_file_stream_from`] should return
+    /// `true`; compatibility implementations remain fail-closed by default.
+    fn supports_read_file_stream_from(&self) -> bool {
+        false
+    }
 
     /// Reads a file and decodes it as UTF-8 text.
     fn read_file_text<'a>(

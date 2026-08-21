@@ -306,7 +306,11 @@ pub(crate) async fn handle_output_item_done(
                 )
                 .await;
 
-            let payload_preview = tool_log_payload(&call.payload, &call.direct_source());
+            let payload_preview = tool_log_payload(
+                &call.payload,
+                &call.direct_source(),
+                ctx.tool_runtime.tool_result_log_policy(&call),
+            );
             tracing::info!(
                 thread_id = %ctx.sess.thread_id,
                 "ToolCall: {} {}",

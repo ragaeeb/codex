@@ -144,17 +144,24 @@ fn canonical_audio_mime(mime: &str) -> Option<&'static str> {
 /// Estimates audio tokens from decoded duration, falling back to the data URL size.
 pub fn estimate_audio_token_count(audio_url: &str) -> usize {
     let key = sha1_digest(audio_url.as_bytes());
-    AUDIO_TOKEN_ESTIMATE_CACHE.get_or_insert_with(key, || {
-        let Some(duration_seconds) = audio_duration_seconds(audio_url) else {
-            return approx_token_count(audio_url);
-        };
-        let token_count = (duration_seconds * AUDIO_TOKENS_PER_SECOND).ceil();
-        if token_count >= usize::MAX as f64 {
-            usize::MAX
-        } else {
-            token_count as usize
-        }
-    })
+    AUDIO_TOKEN_ESTIMATE_CACHE
+        .get_or_insert_with(key, || estimate_audio_token_count_uncached(audio_url))
+}
+
+/// Estimates audio cost without using the process-wide blocking cache.
+///
+/// Async projection paths use this variant so they remain valid on current-thread runtimes. The
+/// cached variant above remains available to synchronous history accounting.
+pub fn estimate_audio_token_count_uncached(audio_url: &str) -> usize {
+    let Some(duration_seconds) = audio_duration_seconds(audio_url) else {
+        return approx_token_count(audio_url);
+    };
+    let token_count = (duration_seconds * AUDIO_TOKENS_PER_SECOND).ceil();
+    if token_count >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        token_count as usize
+    }
 }
 
 fn audio_duration_seconds(audio_url: &str) -> Option<f64> {

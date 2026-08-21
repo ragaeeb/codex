@@ -708,27 +708,11 @@ impl Session {
                 ));
             }
         };
-        if thread_store.supports_local_output_artifacts() {
-            crate::tool_output::sweep_expired_artifacts_once(&config.codex_home).await;
-        }
-        let inherited_output_artifact_ids = if matches!(&initial_history, InitialHistory::Forked(_))
-        {
-            crate::tool_output::referenced_output_artifact_ids(&initial_history)
-        } else {
-            Vec::new()
-        };
-        let inherited_output_artifact_source = if inherited_output_artifact_ids.is_empty() {
-            None
-        } else {
-            if !thread_store.supports_local_output_artifacts() {
-                anyhow::bail!(
-                    "fork history references output artifacts that this thread store cannot transfer"
-                );
-            }
-            Some(forked_from_id.or(parent_thread_id).ok_or_else(|| {
-                anyhow::anyhow!("fork history references output artifacts without a source thread")
-            })?)
-        };
+        let is_artifact_inheriting_fork = matches!(&initial_history, InitialHistory::Forked(_))
+            || matches!(&fork_persistence, ForkPersistence::Referenced { .. });
+        let inherited_output_artifact_source = is_artifact_inheriting_fork
+            .then(|| forked_from_id.or(parent_thread_id))
+            .flatten();
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {
@@ -960,41 +944,9 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?);
-        let inherited_output_artifact_stores =
-            inherited_output_artifact_source.map(|source_thread_id| {
-                let managed_root = config.codex_home.join("tool_outputs");
-                (
-                    codex_utils_output_truncation::OutputArtifactStore::new(
-                        managed_root.join(source_thread_id.to_string()),
-                    ),
-                    codex_utils_output_truncation::OutputArtifactStore::new(
-                        managed_root.join(thread_id.to_string()),
-                    ),
-                    source_thread_id,
-                )
-            });
+        let mut inherited_output_artifact_stores = None;
         let mut inherited_output_artifacts = false;
         let session_result: anyhow::Result<Arc<Self>> = async {
-            if let Some((source, destination, source_thread_id)) =
-                &inherited_output_artifact_stores
-            {
-                if let Err(err) = source
-                    .copy_to(destination, &inherited_output_artifact_ids)
-                    .await
-                {
-                    if let Err(cleanup_err) = destination.remove_thread().await {
-                        warn!(
-                            child_thread_id = %thread_id,
-                            error_kind = ?cleanup_err.kind(),
-                            "failed to clean partial fork output artifacts"
-                        );
-                    }
-                    return Err(anyhow::anyhow!(
-                        "failed to inherit output artifacts from thread {source_thread_id}: {err}"
-                    ));
-                }
-                inherited_output_artifacts = true;
-            }
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
@@ -1585,6 +1537,74 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
+            if is_artifact_inheriting_fork {
+                let effective_history = sess.clone_history().await;
+                let inherited_output_artifact_ids =
+                    crate::tool_output::referenced_output_artifact_ids(
+                        effective_history.annotated_items(),
+                    );
+                if !inherited_output_artifact_ids.is_empty() {
+                    if !thread_store.supports_local_output_artifacts() {
+                        warn!(
+                            child_thread_id = %thread_id,
+                            "fork output artifacts cannot be transferred by this thread store; child retrieval will report them as unavailable"
+                        );
+                    } else if let Some(source_thread_id) = inherited_output_artifact_source {
+                        let managed_root = config.codex_home.join("tool_outputs");
+                        let stores = (
+                            codex_utils_output_truncation::OutputArtifactStore::new(
+                                managed_root.join(source_thread_id.to_string()),
+                            ),
+                            codex_utils_output_truncation::OutputArtifactStore::new(
+                                managed_root.join(thread_id.to_string()),
+                            ),
+                            source_thread_id,
+                        );
+                        inherited_output_artifact_stores = Some(stores.clone());
+                        for artifact_id in &inherited_output_artifact_ids {
+                            match stores
+                                .0
+                                .copy_to(&stores.1, std::slice::from_ref(artifact_id))
+                                .await
+                            {
+                                Ok(()) => inherited_output_artifacts = true,
+                                Err(err) => {
+                                    if err.kind() == std::io::ErrorKind::NotFound {
+                                        warn!(
+                                            child_thread_id = %thread_id,
+                                            error_kind = ?err.kind(),
+                                            "fork output artifact is unavailable; child retrieval will report it as expired"
+                                        );
+                                        continue;
+                                    }
+                                    let _ = stores.1.remove_thread().await;
+                                    return Err(anyhow::anyhow!(
+                                        "failed to copy fork output artifacts: {err}"
+                                    ));
+                                }
+                            }
+                        }
+                        if inherited_output_artifacts {
+                            // Keep the stores registered for transactional cleanup if a later
+                            // session-initialization step fails.
+                        } else if let Err(err) = stores.1.remove_thread().await {
+                            warn!(
+                                child_thread_id = %thread_id,
+                                error_kind = ?err.kind(),
+                                "failed to clean unavailable fork output artifacts"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            child_thread_id = %thread_id,
+                            "fork output artifacts have no source thread; child retrieval will report them as expired"
+                        );
+                    }
+                }
+            }
+            if thread_store.supports_local_output_artifacts() {
+                crate::tool_output::sweep_expired_artifacts_once(&config.codex_home).await;
+            }
             if restore_child_window {
                 sess.state.lock().await.restore_auto_compact_window(
                     /*window_number*/ 0,

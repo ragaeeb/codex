@@ -34,6 +34,7 @@ use crate::metrics::timer::Timer;
 use crate::provider::OtelProvider;
 use crate::sanitize_metric_tag_value;
 use crate::tool_result::ToolResultEvent;
+use crate::tool_result::ToolResultLogPolicy;
 use crate::tool_result::emit_tool_result;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
@@ -1150,6 +1151,36 @@ impl SessionTelemetry {
         Fut: Future<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
+        self.log_tool_result_with_policy(
+            tool_name,
+            call_id,
+            arguments,
+            ToolResultLogPolicy::Standard,
+            extra_tags,
+            extra_trace_fields,
+            f,
+            log_output,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_tool_result_with_policy<T, F, Fut, E>(
+        &self,
+        tool_name: &ToolName,
+        call_id: &str,
+        arguments: &str,
+        policy: ToolResultLogPolicy,
+        extra_tags: &[(&str, &str)],
+        extra_trace_fields: &[(&str, &str)],
+        f: F,
+        log_output: impl FnOnce(&T) -> (String, bool),
+    ) -> Result<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
         let start = Instant::now();
         let result = f().await;
         let duration = start.elapsed();
@@ -1159,10 +1190,11 @@ impl SessionTelemetry {
             Err(error) => (error.to_string(), false),
         };
 
-        self.tool_result_with_tags(
+        self.tool_result_with_policy(
             tool_name,
             call_id,
             arguments,
+            policy,
             duration,
             success,
             &output,
@@ -1179,6 +1211,32 @@ impl SessionTelemetry {
         tool_name: &ToolName,
         call_id: &str,
         arguments: &str,
+        duration: Duration,
+        success: bool,
+        output: &str,
+        extra_tags: &[(&str, &str)],
+        extra_trace_fields: &[(&str, &str)],
+    ) {
+        self.tool_result_with_policy(
+            tool_name,
+            call_id,
+            arguments,
+            ToolResultLogPolicy::Standard,
+            duration,
+            success,
+            output,
+            extra_tags,
+            extra_trace_fields,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn tool_result_with_policy(
+        &self,
+        tool_name: &ToolName,
+        call_id: &str,
+        arguments: &str,
+        policy: ToolResultLogPolicy,
         duration: Duration,
         success: bool,
         output: &str,
@@ -1208,6 +1266,7 @@ impl SessionTelemetry {
                 duration,
                 success,
                 output,
+                policy,
             },
         );
     }

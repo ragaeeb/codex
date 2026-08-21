@@ -15,6 +15,8 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::io;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
+use tokio::io::SeekFrom;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
@@ -147,6 +149,18 @@ impl LocalFileSystem {
         file_system.read_file_stream(path, sandbox).await
     }
 
+    async fn read_file_stream_from(
+        &self,
+        path: &PathUri,
+        offset: u64,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<FileSystemReadStream> {
+        let (file_system, sandbox) = self.file_system_for(sandbox)?;
+        file_system
+            .read_file_stream_from(path, offset, sandbox)
+            .await
+    }
+
     async fn write_file(
         &self,
         path: &PathUri,
@@ -247,6 +261,21 @@ impl ExecutorFileSystem for LocalFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(LocalFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_stream_from<'a>(
+        &'a self,
+        path: &'a PathUri,
+        offset: u64,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(LocalFileSystem::read_file_stream_from(
+            self, path, offset, sandbox,
+        ))
+    }
+
+    fn supports_read_file_stream_from(&self) -> bool {
+        true
     }
 
     fn write_file<'a>(
@@ -368,6 +397,18 @@ impl UnsandboxedFileSystem {
             .await
     }
 
+    async fn read_file_stream_from(
+        &self,
+        path: &PathUri,
+        offset: u64,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<FileSystemReadStream> {
+        reject_platform_sandbox_context(sandbox)?;
+        self.file_system
+            .read_file_stream_from(path, offset, /*sandbox*/ None)
+            .await
+    }
+
     async fn write_file(
         &self,
         path: &PathUri,
@@ -473,6 +514,21 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(UnsandboxedFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_stream_from<'a>(
+        &'a self,
+        path: &'a PathUri,
+        offset: u64,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(UnsandboxedFileSystem::read_file_stream_from(
+            self, path, offset, sandbox,
+        ))
+    }
+
+    fn supports_read_file_stream_from(&self) -> bool {
+        true
     }
 
     fn write_file<'a>(
@@ -609,7 +665,18 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileSystemReadStream> {
-        let file = self.open_file_for_read(path, sandbox).await?;
+        self.read_file_stream_from(path, /*offset*/ 0, sandbox)
+            .await
+    }
+
+    async fn read_file_stream_from(
+        &self,
+        path: &PathUri,
+        offset: u64,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<FileSystemReadStream> {
+        let mut file = self.open_file_for_read(path, sandbox).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
         Ok(FileSystemReadStream::new(ReaderStream::with_capacity(
             file,
             FILE_READ_CHUNK_SIZE,
@@ -967,6 +1034,21 @@ impl ExecutorFileSystem for DirectFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(DirectFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_stream_from<'a>(
+        &'a self,
+        path: &'a PathUri,
+        offset: u64,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(DirectFileSystem::read_file_stream_from(
+            self, path, offset, sandbox,
+        ))
+    }
+
+    fn supports_read_file_stream_from(&self) -> bool {
+        true
     }
 
     fn write_file<'a>(

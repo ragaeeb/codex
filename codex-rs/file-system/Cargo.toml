@@ -16,5 +16,4 @@ futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
 [lib]
-test = false
 doctest = false

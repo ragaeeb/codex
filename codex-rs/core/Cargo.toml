@@ -153,12 +153,14 @@ core_test_support = { workspace = true }
 ctor = { workspace = true }
 insta = { workspace = true }
 maplit = { workspace = true }
-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true, features = ["logs"] }
+opentelemetry-appender-tracing = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 test-case = "3.3.1"
 opentelemetry_sdk = { workspace = true, features = [
     "experimental_metrics_custom_reader",
+    "logs",
     "metrics",
 ] }
 serial_test = { workspace = true }

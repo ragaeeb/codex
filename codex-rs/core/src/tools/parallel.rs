@@ -26,6 +26,7 @@ use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
+use codex_otel::ToolResultLogPolicy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 
@@ -68,6 +69,10 @@ impl ToolCallRuntime {
         self.step_context
             .tool_router
             .create_diff_consumer(tool_name)
+    }
+
+    pub(crate) fn tool_result_log_policy(&self, call: &ToolCall) -> ToolResultLogPolicy {
+        self.step_context.tool_router.tool_result_log_policy(call)
     }
 
     #[instrument(level = "trace", skip_all)]

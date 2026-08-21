@@ -25,6 +25,7 @@ pub(super) async fn open(
     client: ExecServerClient,
     path: PathUri,
     sandbox: Option<FileSystemSandboxContext>,
+    offset: u64,
 ) -> FileSystemResult<FileSystemReadStream> {
     let registration = FileReadRegistration {
         client,
@@ -42,7 +43,7 @@ pub(super) async fn open(
         .await
         .map_err(map_remote_error)?;
     Ok(FileSystemReadStream::new(futures::stream::try_unfold(
-        Some((registration, 0_u64)),
+        Some((registration, offset)),
         |state| async move {
             let Some((mut registration, offset)) = state else {
                 return Ok(None);

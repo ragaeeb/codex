@@ -301,6 +301,7 @@ pub struct ConfigToml {
     pub project_doc_fallback_filenames: Option<Vec<String>>,
 
     /// Token budget applied when storing tool/function outputs in the context manager.
+    #[serde(default)]
     pub tool_output_token_limit: Option<usize>,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
@@ -973,6 +974,13 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn tool_output_token_limit_preserves_low_legacy_budgets() {
+        let config = toml::from_str::<ConfigToml>("tool_output_token_limit = 50")
+            .expect("existing low budgets remain valid configuration");
+        assert_eq!(config.tool_output_token_limit, Some(50));
+    }
 
     #[test]
     fn forced_chatgpt_workspace_id_accepts_single_string() {

@@ -210,6 +210,15 @@ impl FunctionToolOutput {
         }
     }
 
+    pub(crate) fn from_managed_artifact_reference_text(text: String) -> Self {
+        Self {
+            body: vec![FunctionCallOutputContentItem::InputText { text }],
+            success: Some(true),
+            post_tool_use_response: None,
+            provenance: ToolOutputProvenance::ManagedArtifactReference,
+        }
+    }
+
     pub fn from_content(
         content: Vec<FunctionCallOutputContentItem>,
         success: Option<bool>,
@@ -355,6 +364,14 @@ impl ToolOutput for ExecCommandToolOutput {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn provenance(&self) -> ToolOutputProvenance {
+        if self.output_artifact {
+            ToolOutputProvenance::ManagedArtifactReference
+        } else {
+            ToolOutputProvenance::Untrusted
+        }
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

@@ -8,6 +8,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_tools::ToolOutputProvenance;
+use codex_utils_output_truncation::OutputArtifactId;
 use codex_utils_output_truncation::OutputArtifactStore;
 use codex_utils_output_truncation::content_type;
 use serde_json::Value;
@@ -19,10 +20,132 @@ mod event;
 mod inheritance;
 mod retention;
 
+pub(crate) use inheritance::artifact_controls_for_compaction;
+pub(crate) use inheritance::attach_artifact_reference_sidecar;
+pub(crate) use inheritance::has_recoverable_output_artifact;
+pub(crate) use inheritance::merge_artifact_controls;
 pub(crate) use inheritance::referenced_output_artifact_ids;
 pub(crate) use retention::sweep_expired_artifacts_once;
 
-pub(crate) const MIN_ARTIFACT_ENVELOPE_BYTES: usize = 512;
+/// Smallest practical model-facing budget that can carry a recoverable artifact window.
+///
+/// This is a guard, not a renderer: callers still use `try_envelope` and fail closed if a future
+/// schema change makes the concrete control larger. The floor is above the identity-only envelope
+/// because retrieval must have room for a bounded window and continuation metadata as well.
+pub(crate) const MIN_ARTIFACT_ENVELOPE_BYTES: usize = 200;
+/// Independent ceiling for a single managed output item entering model context.
+///
+/// This is deliberately separate from configured truncation policies and the larger artifact
+/// storage/retrieval limit. Eight KiB is a tokenizer-independent ceiling well below the
+/// ten-thousand-token hard limit under the conservative one-byte-per-token bound. It intentionally
+/// crosses the repository's one-thousand-token manual-review gate; the explicit Stage 2 review
+/// acceptance for this cap is recorded here instead of treating it as an ordinary limit.
+pub(crate) const MAX_MANAGED_ARTIFACT_MODEL_BYTES: usize = 8 * 1024;
+/// Aggregate budget for one content-item output after modality-specific accounting. Media inputs
+/// use their own token estimator, so a normal resized image may cost more than the text-item gate
+/// while remaining far below the ten-thousand-token invariant.
+pub(crate) const MAX_CONTENT_ITEMS_MODEL_BYTES: usize = 8 * 1024;
+/// Independent serialized-size ceiling for one content-item response. Modality estimates account
+/// for the model's image/audio cost, while this bound prevents a large encoded media body from
+/// bypassing the ordinary per-item serialization guard.
+pub(crate) const MAX_CONTENT_ITEMS_SERIALIZED_BYTES: usize = 128 * 1024;
+/// Reserve room for the surrounding Responses function-output item when a managed content-item
+/// control is fitted. The generic output policy is expressed in body bytes, but a content-item
+/// control is persisted as a complete model-visible item.
+pub(crate) const MODEL_ITEM_CONTROL_RESERVATION_BYTES: usize = 128;
+
+pub(crate) fn bounded_structured_error(max_bytes: usize) -> String {
+    let error = json!({
+        "type": "tool_output_error",
+        "version": 1,
+        "error": "tool output exceeded the active model output policy"
+    })
+    .to_string();
+    if error.len() <= max_bytes {
+        error
+    } else {
+        [
+            r#"{"type":"tool_output_error","version":1}"#,
+            r#"{"type":"tool_output_error"}"#,
+            r#"{"type":"error"}"#,
+            "{}",
+            "0",
+            "",
+        ]
+        .into_iter()
+        .find(|candidate| candidate.len() <= max_bytes)
+        .unwrap_or_default()
+        .to_string()
+    }
+}
+
+pub(crate) fn bounded_output_payload(
+    output: &FunctionCallOutputPayload,
+    max_bytes: usize,
+) -> FunctionCallOutputPayload {
+    let text = bounded_structured_error(max_bytes);
+    FunctionCallOutputPayload {
+        // Collapse content-item payloads to one text control so the fallback has no aggregate
+        // wrapper siblings that could exceed a tiny policy or inherit a stale sidecar.
+        body: FunctionCallOutputBody::Text(text),
+        // Zero is a representable legacy policy but cannot carry even a structured diagnostic.
+        // Mark the empty body as an explicit fail-closed tool result rather than implying that an
+        // empty successful response was recovered.
+        success: (max_bytes == 0).then_some(false).or(output.success),
+    }
+}
+
+/// Re-renders a trusted artifact control document without its previews when a
+/// smaller policy would otherwise discard the recovery handle. This is only
+/// called for harness-marked output; an arbitrary JSON object must never gain
+/// managed-artifact semantics from this parser.
+pub(crate) fn compact_store_backed_envelope(text: &str, max_bytes: usize) -> Option<String> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let response_type = value.get("type")?.as_str()?;
+    if !matches!(
+        response_type,
+        "tool_output_artifact" | "tool_output_artifact_window" | "tool_output_artifact_search"
+    ) {
+        return None;
+    }
+    let artifact_id = value.get("artifact_id")?.as_str()?;
+    OutputArtifactId::parse(artifact_id).ok()?;
+    let mut compact = json!({
+        "type": response_type,
+        "artifact_id": artifact_id,
+    });
+    if response_type == "tool_output_artifact" {
+        compact["retrieval"] = Value::String(
+            value
+                .get("retrieval")
+                .and_then(Value::as_str)
+                .unwrap_or("Use read_tool_output with this artifact_id.")
+                .to_string(),
+        );
+    }
+    for field in [
+        "mode",
+        "start_byte",
+        "start_line",
+        "next_offset",
+        "next_byte",
+        "complete",
+    ] {
+        if let Some(field_value) = value.get(field) {
+            compact[field] = field_value.clone();
+        }
+    }
+    let with_continuation = compact.to_string();
+    if with_continuation.len() <= max_bytes {
+        return Some(with_continuation);
+    }
+    let id_only = json!({
+        "type": response_type,
+        "artifact_id": artifact_id,
+    })
+    .to_string();
+    (id_only.len() <= max_bytes).then_some(id_only)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectionMeasurement {
@@ -86,38 +209,47 @@ impl ToolOutputProjector {
         family: &'static str,
         provenance: ToolOutputProvenance,
     ) -> (FunctionCallOutputPayload, ProjectionMeasurement, bool) {
-        if provenance == ToolOutputProvenance::ManagedArtifactRetrieval
-            && let FunctionCallOutputBody::Text(text) = &payload.body
-            && text.len() <= STORE_BACKED_TOOL_OUTPUT_MAX_BYTES
+        if matches!(
+            provenance,
+            ToolOutputProvenance::ManagedArtifactRetrieval
+                | ToolOutputProvenance::ManagedArtifactReference
+        ) && let FunctionCallOutputBody::Text(text) = &payload.body
         {
+            let managed_budget = self
+                .policy
+                .byte_budget()
+                .min(STORE_BACKED_TOOL_OUTPUT_MAX_BYTES)
+                .min(MAX_MANAGED_ARTIFACT_MODEL_BYTES);
+            if text.len() <= managed_budget {
+                return (
+                    payload.clone(),
+                    measurement(
+                        family,
+                        "managed_artifact_retrieval_v1",
+                        text.len(),
+                        text.len(),
+                        "inline",
+                    ),
+                    true,
+                );
+            }
+            let bounded = compact_store_backed_envelope(text, managed_budget);
+            let store_backed = bounded.is_some();
+            let bounded = bounded.unwrap_or_else(|| bounded_structured_error(managed_budget));
             return (
-                payload.clone(),
+                replace_text(payload, bounded.clone()),
                 measurement(
                     family,
-                    "managed_artifact_retrieval_v1",
+                    "managed_artifact_policy_compact_v1",
                     text.len(),
-                    text.len(),
-                    "inline",
+                    bounded.len(),
+                    "fallback",
                 ),
-                true,
+                store_backed,
             );
         }
-        if let FunctionCallOutputBody::ContentItems(items) = &payload.body {
-            let original_bytes = items.iter().filter_map(text_item).map(String::len).sum();
-            if original_bytes > self.policy.byte_budget() {
-                return self.project_content_items(payload, family).await;
-            }
-            return (
-                payload.clone(),
-                measurement(
-                    family,
-                    "inline_v1",
-                    original_bytes,
-                    original_bytes,
-                    "inline",
-                ),
-                false,
-            );
+        if let FunctionCallOutputBody::ContentItems(_) = &payload.body {
+            return self.project_content_items(payload, family).await;
         }
         let Some(text) = payload.body.to_text() else {
             return (
@@ -161,6 +293,21 @@ impl ToolOutputProjector {
                 false,
             );
         }
+        if self.policy.byte_budget() < MIN_ARTIFACT_ENVELOPE_BYTES {
+            let output = truncate_function_output_payload(payload, self.policy);
+            let inline_bytes = output.body.to_text().map_or(0, |text| text.len());
+            return (
+                output,
+                measurement(
+                    family,
+                    "artifact_policy_too_small_v1",
+                    original_bytes,
+                    inline_bytes,
+                    "fallback",
+                ),
+                false,
+            );
+        }
         match self.store.store_text(&text).await {
             Ok(artifact) => {
                 let rule = if artifact.reused {
@@ -168,19 +315,42 @@ impl ToolOutputProjector {
                 } else {
                     "spill_v1"
                 };
-                let envelope = artifact_envelope(
+                let Some(envelope) = artifact_envelope(
                     &artifact,
                     &text,
-                    self.policy.byte_budget().clamp(
-                        MIN_ARTIFACT_ENVELOPE_BYTES,
-                        STORE_BACKED_TOOL_OUTPUT_MAX_BYTES,
-                    ),
-                );
+                    self.policy
+                        .byte_budget()
+                        .min(STORE_BACKED_TOOL_OUTPUT_MAX_BYTES),
+                ) else {
+                    let output = truncate_function_output_payload(
+                        payload,
+                        TruncationPolicy::Bytes(
+                            self.policy
+                                .byte_budget()
+                                .min(STORE_BACKED_TOOL_OUTPUT_MAX_BYTES),
+                        ),
+                    );
+                    let inline_bytes = output.body.to_text().map_or(0, |text| text.len());
+                    return (
+                        output,
+                        measurement(
+                            family,
+                            "artifact_control_unavailable_v1",
+                            original_bytes,
+                            inline_bytes,
+                            "fallback",
+                        ),
+                        false,
+                    );
+                };
                 let inline_bytes = envelope.len();
+                let store_backed = serde_json::from_str::<Value>(&envelope)
+                    .ok()
+                    .is_some_and(|value| value["type"] == "tool_output_artifact");
                 (
                     replace_text(payload, envelope),
                     measurement(family, rule, original_bytes, inline_bytes, "spilled"),
-                    true,
+                    store_backed,
                 )
             }
             Err(err) => {
@@ -210,13 +380,6 @@ fn text_item(item: &FunctionCallOutputContentItem) -> Option<&String> {
     }
 }
 
-fn text_item_mut(item: &mut FunctionCallOutputContentItem) -> Option<&mut String> {
-    match item {
-        FunctionCallOutputContentItem::InputText { text } => Some(text),
-        _ => None,
-    }
-}
-
 fn replace_text(payload: &FunctionCallOutputPayload, text: String) -> FunctionCallOutputPayload {
     let mut output = payload.clone();
     match &mut output.body {
@@ -233,19 +396,23 @@ fn artifact_envelope(
     artifact: &codex_utils_output_truncation::StoredOutputArtifact,
     text: &str,
     max_bytes: usize,
-) -> String {
-    let envelope = artifact.envelope(content_type(text), max_bytes);
-    let Ok(mut envelope) = serde_json::from_str::<Value>(&envelope) else {
-        return envelope;
-    };
+) -> Option<String> {
+    let envelope = artifact.try_envelope(content_type(text), max_bytes)?;
+    let mut envelope = serde_json::from_str::<Value>(&envelope).ok()?;
     if let Some(execution) = unified_exec_metadata(text) {
         envelope["execution"] = execution;
     }
     let with_execution = envelope.to_string();
-    if with_execution.len() <= max_bytes {
-        with_execution
+    if with_execution.len() <= max_bytes && envelope["type"] == "tool_output_artifact" {
+        Some(with_execution)
     } else {
-        artifact.envelope(content_type(text), max_bytes)
+        artifact
+            .try_envelope(content_type(text), max_bytes)
+            .filter(|envelope| {
+                serde_json::from_str::<Value>(envelope)
+                    .ok()
+                    .is_some_and(|value| value["type"] == "tool_output_artifact")
+            })
     }
 }
 

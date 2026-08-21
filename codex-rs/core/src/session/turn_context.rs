@@ -29,6 +29,7 @@ use codex_protocol::turn_input::CyberAccessProgram;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_skills_extension::HostSkillsSnapshot;
 use codex_skills_extension::SkillLoadOutcome;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -234,6 +235,24 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
+    /// Returns the smallest output policy admitted by the model and this turn's configuration.
+    ///
+    /// Tool-output projection is byte-bounded at the final history boundary. Converting both
+    /// policy forms to bytes here makes the configured token override apply consistently to
+    /// direct tools, replay, event projection, and unified exec.
+    pub(crate) fn tool_output_truncation_policy(&self) -> TruncationPolicy {
+        let model_policy: TruncationPolicy = self.model_info().truncation_policy.into();
+        let configured_bytes = self
+            .config
+            .tool_output_token_limit
+            .map(|limit| TruncationPolicy::Tokens(limit).byte_budget());
+        let byte_budget = configured_bytes.map_or_else(
+            || model_policy.byte_budget(),
+            |configured| model_policy.byte_budget().min(configured),
+        );
+        TruncationPolicy::Bytes(byte_budget)
+    }
+
     /// Legacy: returns the frozen initial-turn model metadata.
     /// Step-scoped consumers should use their captured `StepContext::settings`.
     pub(crate) fn model_info(&self) -> &Arc<ModelInfo> {

@@ -80,49 +80,66 @@ pub struct OutputArtifactSweepReport {
 }
 
 impl StoredOutputArtifact {
-    pub fn envelope(&self, content_type: &str, max_bytes: usize) -> String {
-        let render = |head: &str, tail: &str| {
-            json!({
-            "type": "tool_output_artifact", "version": 1,
-            "artifact_id": self.id.as_str(), "content_type": content_type,
-            "original_bytes": self.original_bytes, "original_lines": self.original_lines,
-            "approximate_tokens": crate::approx_tokens_from_byte_count(self.original_bytes),
-            "digest": format!("sha256:{}", self.id.digest()),
-            "preview": {"head": head, "tail": tail},
-            "retrieval": "Use read_tool_output with artifact_id and mode bytes, lines, or search; follow next_offset or next_byte to continue."
-        }).to_string()
-        };
-        let empty = render("", "");
-        if empty.len() >= max_bytes {
-            let minimal = json!({
-                "type": "tool_output_artifact",
-                "artifact_id": self.id.as_str(),
-                "retrieval": "Use read_tool_output with this artifact_id."
-            })
-            .to_string();
-            return if minimal.len() <= max_bytes {
-                minimal
-            } else {
-                crate::truncate_text(
-                    &format!(
-                        "Tool output saved as {}. Use read_tool_output to retrieve it.",
-                        self.id.as_str()
-                    ),
-                    crate::TruncationPolicy::Bytes(max_bytes),
-                )
-            };
+    /// Renders a complete, store-backed recovery control within `max_bytes`.
+    ///
+    /// A managed artifact must never be represented by sliced or otherwise invalid JSON. If the
+    /// budget cannot fit even the artifact identity, fail closed so callers can return their
+    /// ordinary bounded inline/error representation without claiming recoverability.
+    pub fn try_envelope(&self, content_type: &str, max_bytes: usize) -> Option<String> {
+        try_artifact_envelope(
+            &self.id,
+            content_type,
+            self.original_bytes,
+            self.original_lines,
+            &self.preview_head,
+            &self.preview_tail,
+            max_bytes,
+        )
+    }
+}
+
+/// Renders the same bounded recovery control as [`StoredOutputArtifact::try_envelope`] without
+/// requiring a filesystem diagnostic path. Callers that only need to compare envelope economics
+/// can therefore do so deterministically and without depending on the process current directory.
+pub fn try_artifact_envelope(
+    id: &OutputArtifactId,
+    content_type: &str,
+    original_bytes: usize,
+    original_lines: usize,
+    preview_head: &str,
+    preview_tail: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    let render = |head: &str, tail: &str| {
+        json!({
+        "type": "tool_output_artifact", "version": 1,
+        "artifact_id": id.as_str(), "content_type": content_type,
+        "original_bytes": original_bytes, "original_lines": original_lines,
+        "approximate_tokens": crate::approx_tokens_from_byte_count(original_bytes),
+        "digest": format!("sha256:{}", id.digest()),
+        "preview": {"head": head, "tail": tail},
+        "retrieval": "Use read_tool_output with artifact_id and mode bytes, lines, or search; follow next_offset or next_byte to continue."
+    }).to_string()
+    };
+    let empty = render("", "");
+    if empty.len() > max_bytes {
+        let minimal = json!({
+            "type": "tool_output_artifact",
+            "artifact_id": id.as_str(),
+        })
+        .to_string();
+        return (minimal.len() <= max_bytes).then_some(minimal);
+    }
+    let preview_budget = max_bytes - empty.len();
+    let mut per_side = preview_budget / 2;
+    loop {
+        let head = take_bytes_at_char_boundary(preview_head, per_side);
+        let tail = tail_bytes_at_char_boundary(preview_tail, per_side);
+        let rendered = render(head, tail);
+        if rendered.len() <= max_bytes || per_side == 0 {
+            return (rendered.len() <= max_bytes).then_some(rendered);
         }
-        let preview_budget = max_bytes - empty.len();
-        let mut per_side = preview_budget / 2;
-        loop {
-            let head = take_bytes_at_char_boundary(&self.preview_head, per_side);
-            let tail = tail_bytes_at_char_boundary(&self.preview_tail, per_side);
-            let rendered = render(head, tail);
-            if rendered.len() <= max_bytes || per_side == 0 {
-                return rendered;
-            }
-            per_side = per_side.saturating_sub((rendered.len() - max_bytes).div_ceil(2).max(1));
-        }
+        per_side = per_side.saturating_sub((rendered.len() - max_bytes).div_ceil(2).max(1));
     }
 }
 
@@ -216,7 +233,103 @@ impl OutputArtifactStore {
         offset: u64,
         max_bytes: usize,
     ) -> io::Result<(String, u64, u64, Option<u64>)> {
-        let max_bytes = bounded(max_bytes, MAX_ARTIFACT_READ_BYTES, "max_bytes")?.max(4);
+        let max_bytes = bounded(max_bytes, MAX_ARTIFACT_READ_BYTES, "max_bytes")?;
+        let (raw_bytes, raw_start, _, raw_next) = self
+            .read_raw_bytes(
+                id,
+                offset,
+                max_bytes.saturating_add(3).min(MAX_ARTIFACT_READ_BYTES),
+            )
+            .await?;
+        let leading = raw_bytes
+            .iter()
+            .take(3)
+            .take_while(|byte| (**byte & 0xc0) == 0x80)
+            .count();
+        // At offset zero, a leading continuation byte is simply invalid raw content and must
+        // remain eligible for the byte-safe/base64 retrieval fallback. Only a nonzero caller
+        // offset can be actionable evidence that it landed inside an otherwise valid scalar.
+        if offset > 0 && leading > 0 {
+            let probe_offset = offset.saturating_sub(3);
+            let (probe, probe_start, _, _) = self
+                .read_raw_bytes(id, probe_offset, /*max_bytes*/ 4)
+                .await?;
+            let relative_offset =
+                usize::try_from(offset.saturating_sub(probe_start)).unwrap_or(usize::MAX);
+            let inside_scalar = (0..relative_offset).any(|start| {
+                let width = match probe.get(start).copied() {
+                    Some(0..=0x7f) => Some(1),
+                    Some(0xc2..=0xdf) => Some(2),
+                    Some(0xe0..=0xef) => Some(3),
+                    Some(0xf0..=0xf4) => Some(4),
+                    _ => None,
+                };
+                let Some(width) = width else {
+                    return false;
+                };
+                start < relative_offset
+                    && relative_offset < start.saturating_add(width)
+                    && start.saturating_add(width) <= probe.len()
+                    && std::str::from_utf8(&probe[start..start + width]).is_ok()
+            });
+            let (kind, message) = if inside_scalar {
+                (
+                    io::ErrorKind::InvalidInput,
+                    "output artifact offset is inside a UTF-8 scalar; use a character boundary",
+                )
+            } else {
+                (
+                    io::ErrorKind::InvalidData,
+                    "output artifact contains non-UTF-8 bytes",
+                )
+            };
+            return Err(io::Error::new(kind, message));
+        }
+        let start = raw_start;
+        let bytes = &raw_bytes[..raw_bytes.len().min(max_bytes)];
+        let consumed = match std::str::from_utf8(bytes) {
+            Ok(_) => bytes.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "output artifact contains non-UTF-8 bytes",
+                ));
+            }
+        };
+        if consumed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output artifact byte window cannot fit one UTF-8 scalar",
+            ));
+        }
+        let text = String::from_utf8(bytes[..consumed].to_vec()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "output artifact contains non-UTF-8 bytes",
+            )
+        })?;
+        let end = start.saturating_add(consumed as u64);
+        let next = if end < start.saturating_add(raw_bytes.len() as u64) {
+            Some(end)
+        } else {
+            raw_next.map(|_| end)
+        };
+        Ok((text, start, end, next))
+    }
+
+    /// Reads exact stored bytes without interpreting them as UTF-8.
+    ///
+    /// Text-oriented retrieval uses [`Self::read_bytes`], which rejects invalid UTF-8. Producers
+    /// such as unified exec may still store arbitrary bytes, so byte-safe callers can request a
+    /// base64 window without losing offsets or silently replacing bytes.
+    pub async fn read_raw_bytes(
+        &self,
+        id: &OutputArtifactId,
+        offset: u64,
+        max_bytes: usize,
+    ) -> io::Result<(Vec<u8>, u64, u64, Option<u64>)> {
+        let max_bytes = bounded(max_bytes, MAX_ARTIFACT_READ_BYTES, "max_bytes")?;
         let _guard = lock_artifact_store().await?;
         if !existing_dir(&self.managed_root).await? || !existing_dir(&self.root).await? {
             return Err(io::Error::new(
@@ -228,27 +341,14 @@ impl OutputArtifactStore {
         let (mut file, size) = self.open(id).await?;
         self.touch_access().await?;
         if offset >= size {
-            return Ok((String::new(), size, size, None));
+            return Ok((Vec::new(), size, size, None));
         }
         file.seek(io::SeekFrom::Start(offset)).await?;
-        let mut bytes = vec![0; max_bytes + 3];
+        let mut bytes = vec![0; max_bytes];
         let read = file.read(&mut bytes).await?;
         bytes.truncate(read);
-        let leading = bytes
-            .iter()
-            .take(3)
-            .take_while(|byte| (**byte & 0xc0) == 0x80)
-            .count();
-        let start = offset + leading as u64;
-        let bytes = &bytes[leading..bytes.len().min(leading + max_bytes)];
-        let consumed = match std::str::from_utf8(bytes) {
-            Ok(_) => bytes.len(),
-            Err(err) if err.error_len().is_none() => err.valid_up_to(),
-            Err(_) => bytes.len(),
-        };
-        let text = String::from_utf8_lossy(&bytes[..consumed]).into_owned();
-        let end = start + consumed as u64;
-        Ok((text, start, end, (end < size).then_some(end)))
+        let end = offset.saturating_add(bytes.len() as u64);
+        Ok((bytes, offset, end, (end < size).then_some(end)))
     }
 
     /// Returns the byte length of a safely opened managed artifact.

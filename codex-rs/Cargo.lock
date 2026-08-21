@@ -2843,6 +2843,7 @@ dependencies = [
  "once_cell",
  "openssl-sys",
  "opentelemetry",
+ "opentelemetry-appender-tracing",
  "opentelemetry_sdk",
  "predicates",
  "pretty_assertions",

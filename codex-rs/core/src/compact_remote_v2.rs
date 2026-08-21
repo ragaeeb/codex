@@ -52,6 +52,7 @@ use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_utils_output_truncation::OutputArtifactId;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::StreamExt;
@@ -294,6 +295,8 @@ async fn run_remote_compact_task_inner_impl(
         trace_input_history,
         prompt_input,
         prompt_input_metadata,
+        artifact_controls,
+        artifact_reference_ids,
         compaction_output,
         token_usage,
         owned_client_session: _owned_client_session,
@@ -315,6 +318,8 @@ async fn run_remote_compact_task_inner_impl(
         } else {
             RetainedImageBudget::Disabled
         },
+        artifact_controls,
+        artifact_reference_ids,
     );
     analytics_details.retained_image_count = Some(retained_images);
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
@@ -478,6 +483,8 @@ fn build_v2_compacted_history(
     compaction_output: ResponseItem,
     retain_client_developer_messages: bool,
     image_budget: RetainedImageBudget,
+    preserved_artifact_controls: Vec<ResponseItemEnvelope>,
+    preserved_artifact_ids: Vec<OutputArtifactId>,
 ) -> (Vec<ResponseItemEnvelope>, usize) {
     debug_assert_eq!(prompt_input.len(), prompt_input_metadata.len());
     let prompt_input = prompt_input
@@ -485,6 +492,19 @@ fn build_v2_compacted_history(
         .zip(prompt_input_metadata)
         .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
         .collect::<Vec<_>>();
+    let artifact_controls = if preserved_artifact_controls.is_empty() {
+        crate::tool_output::artifact_controls_for_compaction(&prompt_input)
+    } else {
+        preserved_artifact_controls
+    };
+    let artifact_reference_ids = if preserved_artifact_ids.is_empty() {
+        crate::tool_output::referenced_output_artifact_ids(&prompt_input)
+    } else {
+        preserved_artifact_ids
+    };
+    // V2 compaction retains user/developer context and the new summary, not historical tool
+    // outputs. Store-backed artifacts are inheritable only when their trusted sidecar survives
+    // in effective history; artifact-shaped IDs mentioned by the summary are untrusted text.
     let retained = v2_history_item_groups(prompt_input)
         .filter(|group| is_retained_for_remote_compaction_v2(&group.source.item))
         .filter(|group| {
@@ -496,11 +516,13 @@ fn build_v2_compacted_history(
         .collect::<Vec<_>>();
     let mut retained =
         truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET, image_budget);
+    let mut retained = crate::tool_output::merge_artifact_controls(retained, artifact_controls);
     let retained_image_count = retained
         .iter()
         .map(|envelope| retained_input_image_count(&envelope.item))
         .sum::<usize>();
     retained.push(ResponseItemEnvelope::new(compaction_output));
+    crate::tool_output::attach_artifact_reference_sidecar(&mut retained, &artifact_reference_ids);
     (retained, retained_image_count)
 }
 
@@ -743,8 +765,10 @@ mod tests {
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ContentItemKind;
     use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::models::MessagePhase;
     use pretty_assertions::assert_eq;
+    use serde_json::Value;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -771,6 +795,8 @@ mod tests {
             output,
             /*retain_client_developer_messages*/ false,
             RetainedImageBudget::Disabled,
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -880,6 +906,8 @@ mod tests {
                 output.clone(),
                 enabled,
                 RetainedImageBudget::Disabled,
+                Vec::new(),
+                Vec::new(),
             );
             let mut expected = vec![
                 ResponseItemEnvelope {
@@ -900,6 +928,56 @@ mod tests {
             }
             assert_eq!(history, expected);
         }
+    }
+
+    #[test]
+    fn build_v2_compacted_history_keeps_controls_captured_before_output_rewrite() {
+        let artifact_id = "out_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let call = ResponseItemEnvelope::new(ResponseItem::FunctionCall {
+            id: None,
+            name: "read_file".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            encrypted_function_args: None,
+            call_id: "read-call".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        let output = ResponseItemEnvelope {
+            item: ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("read-call".to_string()),
+                name: None,
+                namespace: None,
+                output: FunctionCallOutputPayload::from_text(format!(
+                    r#"{{"type":"tool_output_artifact","artifact_id":"{artifact_id}"}}"#
+                )),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            metadata: Some(CodexHarnessMetadata::store_backed_tool_output()),
+        };
+        let source = vec![call, output];
+        let controls = crate::tool_output::artifact_controls_for_compaction(&source);
+        let ids = crate::tool_output::referenced_output_artifact_ids(&source);
+        let replacement = ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "summary".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+
+        let (history, _) = build_v2_compacted_history(
+            vec![message("user", "summary", /*phase*/ None)],
+            vec![None],
+            replacement,
+            /*retain_client_developer_messages*/ false,
+            controls,
+            ids,
+        );
+        let retained_controls = crate::tool_output::artifact_controls_for_compaction(&history);
+        let ResponseItem::FunctionCall { arguments, .. } = &retained_controls[0].item else {
+            panic!("expected canonical artifact retrieval call");
+        };
+        let arguments: Value = serde_json::from_str(arguments).expect("valid retrieval arguments");
+        assert_eq!(arguments["artifact_id"], artifact_id);
     }
 
     #[test]

@@ -27,6 +27,7 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -40,6 +41,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_utils_output_truncation::approx_token_count;
+use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 
 #[path = "compact_remote_request.rs"]
@@ -264,10 +266,25 @@ async fn run_remote_compact_task_inner_impl(
     let RemoteCompactAttempt {
         new_history,
         trace_input_history,
+        store_backed_history,
+        artifact_reference_ids,
     } = attempt;
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (new_history, world_state_baseline) =
-        process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;
+    let annotated_new_history = annotate_store_backed_history(new_history, &store_backed_history);
+    let annotated_new_history =
+        crate::tool_output::merge_artifact_controls(annotated_new_history, store_backed_history);
+    let (mut new_history, world_state_baseline) = process_annotated_compacted_history(
+        sess.as_ref(),
+        annotated_new_history,
+        &initial_context_injection,
+    )
+    .await;
+    // Attach after legacy provider filtering so a discarded last output cannot take the only
+    // history-side carrier of the bounded artifact inventory with it.
+    crate::tool_output::attach_artifact_reference_sidecar(
+        &mut new_history,
+        &artifact_reference_ids,
+    );
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -279,17 +296,15 @@ async fn run_remote_compact_task_inner_impl(
     // thread history. Keep it distinct from the later inference request so the reducer can
     // still represent repeated developer/context prefix items exactly as the model saw them.
     if let Some(trace_input_history) = trace_input_history.as_deref() {
+        let trace_replacement_history = new_history
+            .iter()
+            .map(|envelope| envelope.item.clone())
+            .collect::<Vec<_>>();
         compaction_trace.record_installed(&CompactionCheckpointTracePayload {
             input_history: trace_input_history,
-            replacement_history: &new_history,
+            replacement_history: &trace_replacement_history,
         });
     }
-    // Legacy `/responses/compact` returns provider-normalized items without a stable link to their
-    // original envelopes, so it does not preserve harness metadata. Compaction-trigger/v2 does.
-    let new_history = new_history
-        .into_iter()
-        .map(ResponseItemEnvelope::new)
-        .collect();
     sess.replace_compacted_history(
         new_history,
         reference_context_item,
@@ -308,6 +323,29 @@ async fn run_remote_compact_task_inner_impl(
     Ok(())
 }
 
+fn annotate_store_backed_history(
+    items: Vec<ResponseItem>,
+    source: &[ResponseItemEnvelope],
+) -> Vec<ResponseItemEnvelope> {
+    items
+        .into_iter()
+        .map(|item| {
+            let metadata = source
+                .iter()
+                .find(|envelope| {
+                    envelope
+                        .metadata
+                        .as_ref()
+                        .is_some_and(CodexHarnessMetadata::is_store_backed_tool_output)
+                        && envelope.item == item
+                })
+                .and_then(|envelope| envelope.metadata.clone());
+            ResponseItemEnvelope { item, metadata }
+        })
+        .collect()
+}
+
+#[cfg(test)]
 pub(crate) async fn process_compacted_history(
     sess: &Session,
     compacted_history: Vec<ResponseItem>,
@@ -335,20 +373,86 @@ pub(crate) async fn process_annotated_compacted_history(
     compacted_history: Vec<ResponseItemEnvelope>,
     initial_context_injection: &InitialContextInjection,
 ) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>) {
+    // Legacy remote compaction may reattach a store-backed output only when its function call is
+    // present in the same effective call group. Fork inheritance later scans this reconstructed
+    // history, never the discarded append-only input, so orphan outputs cannot survive either
+    // compaction or fork creation.
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
     // compaction item, but mid-turn compaction keeps the compaction item last for model training.
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess, initial_context_injection).await;
 
+    let paired_artifact_call_ids = paired_store_backed_call_ids(&compacted_history);
     let compacted_history = history_item_groups(compacted_history)
-        .filter(|group| should_keep_compacted_history_item(&group.source.item))
+        .filter(|group| should_keep_compacted_history_group(group, &paired_artifact_call_ids))
         .flat_map(HistoryItemGroup::into_items)
         .collect();
     (
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context),
         world_state_baseline,
     )
+}
+
+fn paired_store_backed_call_ids(items: &[ResponseItemEnvelope]) -> HashSet<String> {
+    let call_ids = items
+        .iter()
+        .filter_map(|envelope| response_call_id(&envelope.item).map(str::to_string))
+        .collect::<HashSet<_>>();
+    items
+        .iter()
+        .filter(|envelope| {
+            envelope
+                .metadata
+                .as_ref()
+                .is_some_and(CodexHarnessMetadata::is_store_backed_tool_output)
+        })
+        .filter_map(|envelope| response_output_call_id(&envelope.item))
+        .filter(|call_id| call_ids.contains(*call_id))
+        .map(str::to_string)
+        .collect()
+}
+
+fn response_call_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::LocalShellCall {
+            call_id: Some(call_id),
+            ..
+        } => Some(call_id.as_str()),
+        ResponseItem::FunctionCall { call_id, .. }
+        | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+        _ => None,
+    }
+}
+
+fn response_output_call_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::FunctionCallOutput { call_id, .. } => call_id.as_deref(),
+        ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+        _ => None,
+    }
+}
+
+fn should_keep_compacted_history_group(
+    group: &HistoryItemGroup<ResponseItemEnvelope>,
+    paired_artifact_call_ids: &HashSet<String>,
+) -> bool {
+    if group
+        .source
+        .metadata
+        .as_ref()
+        .is_some_and(CodexHarnessMetadata::is_store_backed_tool_output)
+        && response_output_call_id(&group.source.item)
+            .is_some_and(|call_id| paired_artifact_call_ids.contains(call_id))
+    {
+        return true;
+    }
+    if response_call_id(&group.source.item)
+        .is_some_and(|call_id| paired_artifact_call_ids.contains(call_id))
+    {
+        return true;
+    }
+    should_keep_compacted_history_item(&group.source.item)
 }
 
 /// Returns whether an item from remote compaction output should be preserved.
@@ -505,7 +609,15 @@ fn rewritten_output_for_context_window(
     };
     Some(ResponseItemEnvelope {
         item,
-        metadata: envelope.metadata.clone(),
+        // Rewriting a trusted output to the generic compaction marker destroys its artifact
+        // handle. Do not carry the sidecar across that rewrite; otherwise later fork/retention
+        // logic could treat an unrecoverable marker as store-backed provenance.
+        metadata: (!envelope
+            .metadata
+            .as_ref()
+            .is_some_and(CodexHarnessMetadata::is_store_backed_tool_output))
+        .then(|| envelope.metadata.clone())
+        .flatten(),
     })
 }
 

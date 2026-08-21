@@ -193,6 +193,7 @@ pub use output_artifacts::OutputArtifactStore;
 pub use output_artifacts::OutputArtifactSweepReport;
 pub use output_artifacts::StoredOutputArtifact;
 pub use output_artifacts::content_type;
+pub use output_artifacts::try_artifact_envelope;
 
 #[cfg(test)]
 #[path = "output_artifacts_tests.rs"]

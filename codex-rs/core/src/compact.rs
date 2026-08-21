@@ -351,12 +351,21 @@ async fn run_compact_task_inner_impl(
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
+    let artifact_controls = crate::tool_output::artifact_controls_for_compaction(history_items);
+    let artifact_reference_ids = crate::tool_output::referenced_output_artifact_ids(history_items);
     let summary_suffix =
         get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_annotated_user_messages(history_items);
 
-    let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+    // Local compaction intentionally replaces tool outputs with the summary. Artifact inheritance
+    // follows only the effective post-compaction history, so an artifact-shaped string in the
+    // summary is ordinary model text and cannot make a fork copy an arbitrary store entry.
+    let mut new_history = build_compacted_history(artifact_controls, &user_messages, &summary_text);
+    crate::tool_output::attach_artifact_reference_sidecar(
+        &mut new_history,
+        &artifact_reference_ids,
+    );
     if let Some(summary_item) = new_history.last_mut() {
         // This replacement history skips `record_conversation_items`; only the appended summary
         // belongs to this compaction turn.

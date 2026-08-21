@@ -103,6 +103,131 @@ async fn stores_once_and_rejects_unmanaged_paths() {
     }
 }
 
+#[tokio::test]
+async fn raw_artifact_windows_preserve_invalid_utf8_without_lossy_text() {
+    let temp = tempdir().expect("tempdir");
+    let store = artifact_store(temp.path());
+    let bytes = vec![0xff, 0x00, b'a', 0xc3, 0xa9];
+    let artifact = store.store_bytes(&bytes).await.expect("store bytes");
+
+    assert_eq!(
+        store
+            .read_bytes(&artifact.id, /*offset*/ 0, /*max_bytes*/ 5)
+            .await
+            .expect_err("text retrieval must reject invalid UTF-8")
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        store
+            .read_raw_bytes(&artifact.id, /*offset*/ 1, /*max_bytes*/ 3)
+            .await
+            .expect("raw window"),
+        (bytes[1..4].to_vec(), 1, 4, Some(4))
+    );
+}
+
+#[tokio::test]
+async fn text_artifact_windows_reject_offsets_inside_utf8_scalars() {
+    let temp = tempdir().expect("tempdir");
+    let store = artifact_store(temp.path());
+    let artifact = store.store_text("aéz").await.expect("store text");
+
+    let error = store
+        .read_bytes(&artifact.id, /*offset*/ 2, /*max_bytes*/ 8)
+        .await
+        .expect_err("continuation byte offset must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("UTF-8 scalar"));
+}
+
+#[tokio::test]
+async fn final_multibyte_scalar_gets_a_continuation_when_the_page_boundary_splits_it() {
+    let temp = tempdir().expect("tempdir");
+    let store = artifact_store(temp.path());
+    let text = "ab🙂";
+    let artifact = store.store_text(text).await.expect("store text");
+
+    let first = store
+        .read_bytes(&artifact.id, /*offset*/ 0, /*max_bytes*/ 3)
+        .await
+        .expect("first page");
+    assert_eq!(first.0, "ab");
+    assert_eq!(first.3, Some(2));
+
+    let second = store
+        .read_bytes(
+            &artifact.id,
+            /*offset*/ first.3.expect("continuation"),
+            /*max_bytes*/ 4,
+        )
+        .await
+        .expect("second page");
+    assert_eq!(second.0, "🙂");
+    assert_eq!(second.3, None);
+    assert_eq!(format!("{}{}", first.0, second.0), text);
+}
+
+#[tokio::test]
+async fn raw_continuation_looking_bytes_fall_back_to_exact_base64_pages() {
+    let temp = tempdir().expect("tempdir");
+    let store = artifact_store(temp.path());
+    let bytes = vec![b'a', 0x80, 0xff, b'z'];
+    let artifact = store.store_bytes(&bytes).await.expect("store bytes");
+
+    let second = store
+        .read_bytes(&artifact.id, /*offset*/ 1, /*max_bytes*/ 2)
+        .await
+        .expect_err("raw continuation bytes must use the byte-safe path");
+    assert_eq!(second.kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn path_free_envelope_renderer_matches_stored_artifact() {
+    let temp = tempdir().expect("tempdir");
+    let store = artifact_store(temp.path());
+    let text = "head\ncontent\ntail";
+    let artifact = store.store_text(text).await.expect("store");
+    assert_eq!(
+        try_artifact_envelope(
+            &artifact.id,
+            "text/plain",
+            artifact.original_bytes,
+            artifact.original_lines,
+            &artifact.preview_head,
+            &artifact.preview_tail,
+            /*max_bytes*/ 768,
+        ),
+        artifact.try_envelope("text/plain", /*max_bytes*/ 768),
+    );
+}
+
+#[tokio::test]
+async fn artifact_envelope_fails_closed_before_the_identity_fits() {
+    let temp = tempdir().expect("tempdir");
+    let store = artifact_store(temp.path());
+    let artifact = store.store_text("recoverable output").await.expect("store");
+
+    assert!(
+        artifact
+            .try_envelope("text/plain", /*max_bytes*/ 0)
+            .is_none()
+    );
+    assert!(
+        artifact
+            .try_envelope("text/plain", /*max_bytes*/ 115)
+            .is_none()
+    );
+
+    let envelope = artifact
+        .try_envelope("text/plain", /*max_bytes*/ 128)
+        .expect("identity-only control should fit");
+    let value: serde_json::Value = serde_json::from_str(&envelope).expect("valid JSON");
+    assert_eq!(value["type"], "tool_output_artifact");
+    assert_eq!(value["artifact_id"], artifact.id.as_str());
+    assert!(envelope.len() <= 128);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cleanup_rejects_a_symlinked_managed_ancestor() {

@@ -47,6 +47,8 @@ pub struct ResponseItemEnvelope {
 /// the fixed metadata needed to recover an artifact can be larger than a very
 /// small configured output limit, but must still have a hard context ceiling.
 pub const STORE_BACKED_TOOL_OUTPUT_MAX_BYTES: usize = 32 * 1024;
+/// Maximum history-only artifact references retained on one metadata carrier.
+pub const MAX_STORE_BACKED_ARTIFACT_REFERENCES: usize = 256;
 
 /// Metadata owned by the Codex harness and persisted with a response item.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
@@ -56,6 +58,35 @@ pub struct CodexHarnessMetadata {
     pub client_authored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_output_provenance: Option<ToolOutputProvenance>,
+    /// Bounded, history-only references retained across compaction. These are never projected to
+    /// the model; they let fork/resume copy a managed artifact even when its model-facing control
+    /// was omitted by the compaction budget.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_artifact_references",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    store_backed_artifact_references: Vec<StoreBackedArtifactReference>,
+}
+
+/// A validated-at-use, history-only reference to an existing managed output artifact.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct StoreBackedArtifactReference {
+    pub artifact_id: String,
+}
+
+fn deserialize_bounded_artifact_references<'de, D>(
+    deserializer: D,
+) -> Result<Vec<StoreBackedArtifactReference>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        Vec::<StoreBackedArtifactReference>::deserialize(deserializer)?
+            .into_iter()
+            .take(MAX_STORE_BACKED_ARTIFACT_REFERENCES)
+            .collect(),
+    )
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -79,6 +110,7 @@ impl CodexHarnessMetadata {
         Self {
             client_authored: false,
             tool_output_provenance: Some(ToolOutputProvenance::StoreBackedArtifactV1),
+            store_backed_artifact_references: Vec::new(),
         }
     }
 
@@ -88,6 +120,32 @@ impl CodexHarnessMetadata {
             self.tool_output_provenance,
             Some(ToolOutputProvenance::StoreBackedArtifactV1)
         )
+    }
+
+    /// Adds bounded history-only artifact references while preserving unrelated metadata.
+    pub fn with_store_backed_artifact_references(
+        mut self,
+        artifact_ids: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.set_store_backed_artifact_references(artifact_ids);
+        self
+    }
+
+    /// Replaces the bounded history-only artifact references on this metadata value.
+    pub fn set_store_backed_artifact_references(
+        &mut self,
+        artifact_ids: impl IntoIterator<Item = String>,
+    ) {
+        self.store_backed_artifact_references = artifact_ids
+            .into_iter()
+            .take(MAX_STORE_BACKED_ARTIFACT_REFERENCES)
+            .map(|artifact_id| StoreBackedArtifactReference { artifact_id })
+            .collect();
+    }
+
+    /// Returns history-only artifact references; callers must validate the IDs before use.
+    pub fn store_backed_artifact_references(&self) -> &[StoreBackedArtifactReference] {
+        &self.store_backed_artifact_references
     }
 }
 

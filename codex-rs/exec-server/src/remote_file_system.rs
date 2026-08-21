@@ -104,9 +104,25 @@ impl RemoteFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileSystemReadStream> {
+        self.read_file_stream_from(path, /*offset*/ 0, sandbox)
+            .await
+    }
+
+    async fn read_file_stream_from(
+        &self,
+        path: &PathUri,
+        offset: u64,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<FileSystemReadStream> {
         trace!("remote fs read_file_stream");
         let client = self.client.get().await.map_err(map_remote_error)?;
-        file_stream::open(client, path.clone(), remote_sandbox_context(sandbox)).await
+        file_stream::open(
+            client,
+            path.clone(),
+            remote_sandbox_context(sandbox),
+            offset,
+        )
+        .await
     }
 
     async fn write_file(
@@ -330,6 +346,21 @@ impl ExecutorFileSystem for RemoteFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(RemoteFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_stream_from<'a>(
+        &'a self,
+        path: &'a PathUri,
+        offset: u64,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(RemoteFileSystem::read_file_stream_from(
+            self, path, offset, sandbox,
+        ))
+    }
+
+    fn supports_read_file_stream_from(&self) -> bool {
+        true
     }
 
     fn write_file<'a>(

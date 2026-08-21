@@ -72,6 +72,7 @@ mod process_exec;
 mod projects;
 mod rate_limit_reset_credits;
 mod rate_limits;
+mod read_file;
 mod realtime_conversation;
 mod recommended_plugins;
 mod remote_control;

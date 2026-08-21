@@ -7,10 +7,6 @@ use serde_json::Value as JsonValue;
 
 use crate::ToolPayload;
 
-const TELEMETRY_PREVIEW_MAX_BYTES: usize = 2 * 1024;
-const TELEMETRY_PREVIEW_MAX_LINES: usize = 64;
-const TELEMETRY_PREVIEW_TRUNCATION_NOTICE: &str = "[... telemetry preview truncated ...]";
-
 /// Harness-owned provenance carried beside model-facing tool output.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ToolOutputProvenance {
@@ -19,6 +15,10 @@ pub enum ToolOutputProvenance {
     Untrusted,
     /// Output was produced by the bounded managed-artifact retrieval handler.
     ManagedArtifactRetrieval,
+    /// Output contains a harness-authored managed-artifact envelope created by a producer such
+    /// as unified exec. This is distinct from retrieval so only trusted producer paths can mark
+    /// an already-stored artifact as inheritable.
+    ManagedArtifactReference,
 }
 /// Model-facing output contract returned by executable tool runtimes.
 pub trait ToolOutput: Send {

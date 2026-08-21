@@ -56,6 +56,28 @@ async fn stream_stops_after_an_exact_block_boundary() -> Result<()> {
 }
 
 #[tokio::test]
+async fn remote_file_stream_starts_at_requested_offset() -> Result<()> {
+    let server = exec_server().await?;
+    let file_system = connect_file_system(server.websocket_url())?;
+    let tmp = TempDir::new()?;
+    let path = tmp.path().join("remote-offset.txt");
+    std::fs::write(&path, b"0123456789")?;
+
+    let chunks = file_system
+        .read_file_stream_from(
+            &PathUri::from_host_native_path(path)?,
+            /*offset*/ 6,
+            /*sandbox*/ None,
+        )
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    assert_eq!(chunks, vec![bytes::Bytes::from_static(b"6789")]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_streams_release_handle_capacity() -> Result<()> {
     let server = exec_server().await?;
     let file_system = connect_file_system(server.websocket_url())?;

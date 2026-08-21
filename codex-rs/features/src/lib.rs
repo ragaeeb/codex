@@ -311,6 +311,8 @@ pub enum Feature {
     Personality,
     /// Enable native artifact tools.
     Artifact,
+    /// Enable the bounded first-party read_file tool.
+    NativeReadFile,
     /// Enable Fast mode selection in the TUI and request layer.
     FastMode,
     /// Enable explicitly requested model changes for later step captures.
@@ -1524,6 +1526,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Artifact,
         key: "artifact",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::NativeReadFile,
+        key: "native_read_file",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

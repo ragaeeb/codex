@@ -29,6 +29,7 @@ pub(crate) struct ToolResultEvent<'a> {
     pub duration: Duration,
     pub success: bool,
     pub output: &'a str,
+    pub policy: ToolResultLogPolicy,
 }
 
 /// Emits diagnostic logs and trace-safe metadata without changing tool-call metrics.
@@ -46,9 +47,33 @@ pub(crate) fn emit_tool_result(
         duration,
         success,
         output,
+        policy,
     } = event;
     let tool_namespace = tool_namespace(tool_name);
-    let preview = telemetry_preview(output, limits);
+    let (safe_arguments, safe_call_id, safe_output, safe_mcp_server, safe_mcp_server_origin) =
+        match policy {
+            ToolResultLogPolicy::Standard => (
+                arguments.to_string(),
+                call_id.to_string(),
+                output.to_string(),
+                mcp_server.to_string(),
+                mcp_server_origin.to_string(),
+            ),
+            ToolResultLogPolicy::ContentFree { tool_family } => (
+                "[content-free tool arguments]".to_string(),
+                "[content-free tool call]".to_string(),
+                serde_json::json!({
+                    "tool_family": tool_family,
+                    "outcome": if success { "success" } else { "error" },
+                    "serialized_bytes": output.len(),
+                    "line_count": output.lines().count(),
+                })
+                .to_string(),
+                String::new(),
+                String::new(),
+            ),
+        };
+    let preview = telemetry_preview(&safe_output, limits);
     let tool_result_seq = next_tool_result_seq();
 
     log_and_trace_event!(
@@ -58,24 +83,24 @@ pub(crate) fn emit_tool_result(
             tool_result_seq = tool_result_seq,
             tool_name = %tool_name.name,
             tool_namespace = %tool_namespace,
-            call_id = %call_id,
+            call_id = %safe_call_id,
             duration_ms = %duration.as_millis(),
             success = %success,
             output_truncated = preview.truncated,
         },
         log: {
             agent_name = %telemetry.metadata.agent_name,
-            arguments = %arguments,
+            arguments = %safe_arguments,
             output = %preview.text,
-            mcp_server = %mcp_server,
-            mcp_server_origin = %mcp_server_origin,
+            mcp_server = %safe_mcp_server,
+            mcp_server_origin = %safe_mcp_server_origin,
         },
         trace: {
             arguments_length = arguments.len() as i64,
             output_length = output.len() as i64,
             output_line_count = output.lines().count() as i64,
-            tool_origin = if mcp_server.is_empty() { "builtin" } else { "mcp" },
-            mcp_tool = !mcp_server.is_empty(),
+            tool_origin = if safe_mcp_server.is_empty() { "builtin" } else { "mcp" },
+            mcp_tool = !safe_mcp_server.is_empty(),
         },
     );
 }
@@ -112,3 +137,13 @@ pub(crate) fn telemetry_preview(
 #[cfg(test)]
 #[path = "tool_result_tests.rs"]
 mod tests;
+/// Decides whether tool-result telemetry may contain the tool's diagnostic data.
+///
+/// The caller owns the sensitivity decision. The exporter only applies this
+/// already-classified policy and never infers sensitivity from a tool name,
+/// namespace, or MCP metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolResultLogPolicy {
+    Standard,
+    ContentFree { tool_family: &'static str },
+}

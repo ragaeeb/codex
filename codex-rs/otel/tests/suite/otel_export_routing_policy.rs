@@ -19,6 +19,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 
+use codex_otel::ToolResultLogPolicy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::ToolName;
@@ -439,6 +440,202 @@ fn otel_export_routing_policy_routes_tool_result_log_and_trace_events() {
     assert!(!tool_trace_attrs.contains_key("output"));
     assert!(!tool_trace_attrs.contains_key("mcp_server"));
     assert!(!tool_trace_attrs.contains_key("mcp_server_origin"));
+}
+
+#[test]
+fn read_file_tool_result_otel_payload_is_content_free() {
+    let log_exporter = InMemoryLogExporter::default();
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(log_exporter.clone())
+        .build();
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let tracer = tracer_provider.tracer("content-free-tool-result-test");
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                &logger_provider,
+            )
+            .with_filter(filter_fn(OtelProvider::log_export_filter)),
+        )
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(filter_fn(OtelProvider::trace_export_filter)),
+        );
+    let telemetry = SessionTelemetry::new(
+        ThreadId::new(),
+        "gpt-5.1",
+        "gpt-5.1",
+        /*account_id*/ None,
+        /*account_email*/ None,
+        /*auth_mode*/ None,
+        "codex_exec".to_string(),
+        /*log_user_prompts*/ false,
+        "test".to_string(),
+        SessionSource::Cli,
+    );
+    let oversized_path = "SECRET_REJECTED_PATH".repeat(10_000);
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        let root = tracing::info_span!("content-free-tool-result-root");
+        let _root_guard = root.enter();
+        telemetry.tool_result_with_tags(
+            &ToolName::plain("ordinary_tool"),
+            "safe-call",
+            r#"{"path":"EXTERNAL_ORDINARY_PATH","environment_id":"EXTERNAL_ENV"}"#,
+            std::time::Duration::ZERO,
+            /*success*/ true,
+            r#"{"type":"ordinary","window":{"text":"SECRET_ORDINARY_CONTENT"}}"#,
+            &[],
+            &[],
+        );
+        telemetry.tool_result_with_tags(
+            &ToolName::plain("ordinary_tool"),
+            "ordinary-error-call",
+            r#"{"path":"EXTERNAL_ORDINARY_ERROR_PATH"}"#,
+            std::time::Duration::ZERO,
+            /*success*/ false,
+            "STANDARD_EXTERNAL_ERROR_DIAGNOSTIC",
+            &[],
+            &[],
+        );
+        telemetry.tool_result_with_tags(
+            &ToolName::plain("read_file"),
+            "external-call",
+            r#"{"path":"EXTERNAL_READ_FILE_PATH"}"#,
+            std::time::Duration::ZERO,
+            /*success*/ true,
+            r#"{"text":"EXTERNAL_READ_FILE_CONTENT"}"#,
+            &[],
+            &[],
+        );
+        telemetry.tool_result_with_tags(
+            &ToolName::namespaced("mcp/", "read_file"),
+            "mcp-call",
+            r#"{"path":"MCP_READ_FILE_PATH"}"#,
+            std::time::Duration::ZERO,
+            /*success*/ true,
+            r#"{"text":"MCP_READ_FILE_CONTENT"}"#,
+            &[],
+            &[],
+        );
+        telemetry.tool_result_with_policy(
+            &ToolName::plain("read_file"),
+            "safe-error",
+            &format!(r#"{{"path":"{oversized_path}"}}"#),
+            ToolResultLogPolicy::ContentFree {
+                tool_family: "read_file",
+            },
+            std::time::Duration::ZERO,
+            /*success*/ false,
+            "read_file could not access SECRET_PATH",
+            &[],
+            &[],
+        );
+        telemetry.tool_result_with_policy(
+            &ToolName::plain("read_tool_output"),
+            "SECRET_CALL_ID",
+            r#"{"artifact_id":"SECRET_ARTIFACT_ID","mode":"bytes","query":"SECRET_QUERY","path":"SECRET_PATH"}"#,
+            ToolResultLogPolicy::ContentFree {
+                tool_family: "read_tool_output",
+            },
+            std::time::Duration::ZERO,
+            /*success*/ true,
+            r#"{"type":"tool_output_artifact_window","artifact_id":"SECRET_ARTIFACT_ID","mode":"bytes","text":"SECRET_BYTES"}"#,
+            &[],
+            &[],
+        );
+        telemetry.tool_result_with_policy(
+            &ToolName::plain("read_tool_output"),
+            "SECRET_ERROR_CALL_ID",
+            r#"{"artifact_id":"SECRET_MISSING_ID","mode":"lines","query":"SECRET_LINES_QUERY"}"#,
+            ToolResultLogPolicy::ContentFree {
+                tool_family: "read_tool_output",
+            },
+            std::time::Duration::ZERO,
+            /*success*/ false,
+            "output artifact SECRET_MISSING_PATH is unavailable",
+            &[],
+            &[],
+        );
+    });
+
+    logger_provider.force_flush().expect("flush read_file logs");
+    let logs = log_exporter
+        .get_emitted_logs()
+        .expect("read_file log export");
+    let rendered = logs
+        .iter()
+        .map(|log| format!("{:?}", log_attributes(&log.record)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for secret in [
+        "SECRET_REJECTED_PATH",
+        "SECRET_ENV",
+        "SECRET_PATH",
+        "SECRET_CONTENT",
+        "SECRET_ARTIFACT",
+        "SECRET_ARTIFACT_ID",
+        "SECRET_BYTES",
+        "SECRET_QUERY",
+        "SECRET_LINES_QUERY",
+        "SECRET_MISSING_PATH",
+        "SECRET_CALL_ID",
+    ] {
+        assert!(!rendered.contains(secret), "telemetry leaked {secret}");
+    }
+    assert!(rendered.contains("SECRET_ORDINARY_CONTENT"));
+    assert!(rendered.contains("EXTERNAL_READ_FILE_CONTENT"));
+    assert!(rendered.contains("MCP_READ_FILE_CONTENT"));
+    assert!(rendered.contains("STANDARD_EXTERNAL_ERROR_DIAGNOSTIC"));
+    assert!(rendered.contains("content-free tool arguments"));
+    assert!(rendered.contains("tool_family\\\":\\\"read_file"));
+    assert!(rendered.contains("tool_family\\\":\\\"read_tool_output"));
+    assert!(rendered.contains("serialized_bytes"));
+
+    tracer_provider
+        .force_flush()
+        .expect("flush tool result spans");
+    let spans = span_exporter
+        .get_finished_spans()
+        .expect("content-free tool result spans");
+    let span_text = spans
+        .iter()
+        .flat_map(|span| {
+            let attributes = format!("{:?}", span.attributes);
+            let events = span
+                .events
+                .events
+                .iter()
+                .map(|event| format!("{:?}", span_event_attributes(event)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            [attributes, events]
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for secret in [
+        "SECRET_REJECTED_PATH",
+        "SECRET_ENV",
+        "SECRET_PATH",
+        "SECRET_CONTENT",
+        "SECRET_ARTIFACT",
+        "SECRET_ARTIFACT_ID",
+        "SECRET_BYTES",
+        "SECRET_QUERY",
+        "SECRET_LINES_QUERY",
+        "SECRET_MISSING_PATH",
+        "SECRET_CALL_ID",
+    ] {
+        assert!(
+            !span_text.contains(secret),
+            "span telemetry leaked {secret}"
+        );
+    }
 }
 
 #[test]

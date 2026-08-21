@@ -20,6 +20,7 @@ use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
 use codex_sandboxing::SandboxType;
+use codex_tools::ToolOutput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
@@ -357,6 +358,10 @@ async fn oversized_shell_output_spills_complete_capture() {
     )
     .await
     .expect("exec output");
+    assert_eq!(
+        output.provenance(),
+        codex_tools::ToolOutputProvenance::ManagedArtifactReference
+    );
     assert_eq!(output.output_omitted_bytes, None);
     let envelope: serde_json::Value = serde_json::from_slice(&output.raw_output).expect("envelope");
     assert!(
@@ -407,11 +412,57 @@ async fn recoverable_shell_capture_falls_back_at_its_hard_quota() {
     assert!(String::from_utf8_lossy(&output).contains("bytes omitted"));
 }
 
+#[tokio::test]
+async fn recoverable_shell_capture_never_publishes_an_unusable_small_policy_handle() {
+    for budget in [128_i64, 199, 200] {
+        let (session, mut turn) = make_session_and_context().await;
+        let mut model_info = (*turn.model_info).clone();
+        model_info.truncation_policy =
+            codex_protocol::openai_models::TruncationPolicyConfig::bytes(budget);
+        turn.model_info = Arc::new(model_info);
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let mut buffer = HeadTailBuffer::new_recoverable(4 * 1024);
+        buffer.push_chunk(vec![b'x'; 2 * 1024]);
+
+        let (output, _, artifact) = recoverable_output(
+            Some(session.as_ref()),
+            Some(turn.as_ref()),
+            &mut buffer,
+            /*spill*/ true,
+        )
+        .await;
+
+        if budget < i64::try_from(crate::tool_output::MIN_ARTIFACT_ENVELOPE_BYTES).unwrap() {
+            assert!(
+                !artifact,
+                "small policy must not publish a retrieval handle"
+            );
+        }
+        if artifact {
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&output).expect("managed output envelope");
+            let id = codex_utils_output_truncation::OutputArtifactId::parse(
+                envelope["artifact_id"].as_str().expect("artifact id"),
+            )
+            .expect("valid artifact id");
+            assert!(
+                session
+                    .output_artifact_store()
+                    .await
+                    .artifact_size(&id)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+}
+
 #[test]
 fn head_tail_buffer_default_preserves_prefix_and_suffix() {
     let mut buffer = HeadTailBuffer::<UNIFIED_EXEC_OUTPUT_MAX_BYTES>::default();
     buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
-    buffer.push_chunk(b"bc".to_vec());
+    buffer.push_chunk(b"bc");
 
     let rendered = buffer.to_bytes();
     assert_eq!(rendered.first(), Some(&b'a'));

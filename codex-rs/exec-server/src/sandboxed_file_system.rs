@@ -3,6 +3,8 @@ use base64::engine::general_purpose::STANDARD;
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_utils_path_uri::PathUri;
 use tokio::io;
+use tokio::io::AsyncSeekExt;
+use tokio::io::SeekFrom;
 use tokio_util::io::ReaderStream;
 
 use crate::CapabilityRootsDiscoverParams;
@@ -352,6 +354,26 @@ impl ExecutorFileSystem for SandboxedFileSystem {
                 FILE_READ_CHUNK_SIZE,
             )))
         })
+    }
+
+    fn read_file_stream_from<'a>(
+        &'a self,
+        path: &'a PathUri,
+        offset: u64,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async move {
+            let mut file = self.open_file_for_read(path, sandbox).await?;
+            file.seek(SeekFrom::Start(offset)).await?;
+            Ok(FileSystemReadStream::new(ReaderStream::with_capacity(
+                file,
+                FILE_READ_CHUNK_SIZE,
+            )))
+        })
+    }
+
+    fn supports_read_file_stream_from(&self) -> bool {
+        true
     }
 
     fn write_file<'a>(

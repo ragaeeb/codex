@@ -311,6 +311,48 @@ async fn file_system_read_file_stream_returns_bounded_chunks(
 #[test_case(FileSystemImplementation::Local ; "local")]
 #[test_case(FileSystemImplementation::Remote ; "remote")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_system_read_file_stream_from_starts_at_exact_offset(
+    implementation: FileSystemImplementation,
+) -> Result<()> {
+    let context = create_file_system_context(implementation).await?;
+    let file_system = context.file_system;
+
+    let tmp = TempDir::new()?;
+    let file_path = tmp.path().join("offset.txt");
+    let contents = b"0123456789";
+    std::fs::write(&file_path, contents)?;
+    let path = PathUri::from_host_native_path(file_path)?;
+    let sandbox = read_only_sandbox(tmp.path().to_path_buf());
+
+    for (offset, expected) in [
+        (6, b"6789".as_slice()),
+        (contents.len() as u64, b"".as_slice()),
+        (contents.len() as u64 + 1, b"".as_slice()),
+    ] {
+        for sandbox in [None, Some(&sandbox)] {
+            let chunks = file_system
+                .read_file_stream_from(&path, offset, sandbox)
+                .await
+                .with_context(|| format!("mode={implementation}, offset={offset}"))?
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert_eq!(
+                chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.iter().copied())
+                    .collect::<Vec<_>>(),
+                expected,
+                "mode={implementation}, offset={offset}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test_case(FileSystemImplementation::Local ; "local")]
+#[test_case(FileSystemImplementation::Remote ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_system_read_file_text_returns_string(
     implementation: FileSystemImplementation,
 ) -> Result<()> {

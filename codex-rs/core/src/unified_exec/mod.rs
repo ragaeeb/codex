@@ -86,6 +86,17 @@ async fn recoverable_output(
 ) -> (Vec<u8>, Option<NonZeroUsize>, bool) {
     let original_bytes = output.total_bytes();
     let omitted = NonZeroUsize::new(output.omitted_bytes());
+    let envelope_budget = turn.map_or(4 * 1024, |turn| {
+        turn.tool_output_truncation_policy()
+            .byte_budget()
+            .min(codex_history::STORE_BACKED_TOOL_OUTPUT_MAX_BYTES)
+    });
+    if envelope_budget < crate::tool_output::MIN_ARTIFACT_ENVELOPE_BYTES {
+        // A producer must not publish an identity-only handle that read_tool_output cannot fit
+        // and advance under the same policy. Keep the bounded preview inline and let the normal
+        // projector apply the active policy; do not create an orphan store entry.
+        return (output.to_bytes_with_omission_marker(), omitted, false);
+    }
     if let Some(session) = session
         && session.output_artifact_spilling_supported()
         && (spill || omitted.is_some())
@@ -98,19 +109,9 @@ async fn recoverable_output(
             .await
         {
             Ok(artifact) => {
-                let envelope = artifact.envelope(
-                    "text/plain",
-                    turn.map_or(4 * 1024, |turn| {
-                        codex_protocol::protocol::TruncationPolicy::from(
-                            turn.model_info.truncation_policy,
-                        )
-                        .byte_budget()
-                    })
-                    .clamp(
-                        crate::tool_output::MIN_ARTIFACT_ENVELOPE_BYTES,
-                        codex_history::STORE_BACKED_TOOL_OUTPUT_MAX_BYTES,
-                    ),
-                );
+                let Some(envelope) = artifact.try_envelope("text/plain", envelope_budget) else {
+                    return (bytes, omitted, false);
+                };
                 if let Some(turn) = turn {
                     crate::session::record_tool_output_projection(
                         turn,

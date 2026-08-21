@@ -82,3 +82,4 @@ pub fn start_global_timer(name: &str, tags: &[(&str, &str)]) -> MetricsResult<Ti
 pub fn global_statsig_metrics_settings() -> Option<StatsigMetricsSettings> {
     crate::metrics::global_statsig_settings()
 }
+pub use crate::tool_result::ToolResultLogPolicy;

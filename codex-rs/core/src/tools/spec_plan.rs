@@ -21,7 +21,6 @@ use crate::tools::handlers::ListMcpResourcesHandler;
 use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
-use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
@@ -49,6 +48,8 @@ use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHand
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::read_file::ReadFileHandler;
+use crate::tools::handlers::read_tool_output::ReadToolOutputHandler;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
@@ -890,7 +891,7 @@ fn code_mode_namespace_descriptions(
 #[instrument(level = "trace", skip_all)]
 fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     registry.add(ReadToolOutputHandler);
-    // Guardian reviewers receive only `exec_command`, `write_stdin`, `view_image`, and
+    // Guardian reviewers receive only `exec_command`, `write_stdin`, `view_image`, `read_file`, and
     // `read_tool_output` when a managed sandbox can enforce the parent's filesystem restrictions;
     // all other general tool sources stay excluded.
     if crate::guardian::is_basic_session_source(&context.turn_context.session_source) {
@@ -938,6 +939,13 @@ fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolR
                     ),
                     include_environment_id,
                 }));
+            }
+            if turn_context
+                .config
+                .features
+                .enabled(Feature::NativeReadFile)
+            {
+                registry.add(ReadFileHandler::new(include_environment_id));
             }
         }
         return;
@@ -1128,6 +1136,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
             ),
             include_environment_id,
         }));
+    }
+
+    if environment_mode.has_environment() && features.enabled(Feature::NativeReadFile) {
+        let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+        registry.add(ReadFileHandler::new(include_environment_id));
     }
 }
 

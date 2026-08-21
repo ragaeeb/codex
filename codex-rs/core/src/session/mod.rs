@@ -2307,7 +2307,7 @@ impl Session {
     pub(crate) async fn send_projected_event(&self, event: Event, turn_context: &TurnContext) {
         let projector = crate::tool_output::ToolOutputProjector::new(
             self.output_artifact_store().await,
-            turn_context.model_info.truncation_policy.into(),
+            turn_context.tool_output_truncation_policy(),
         )
         .with_spilling_supported(self.output_artifact_spilling_supported());
         let message = projector.project_event_msg(&event.msg).await;
@@ -3282,7 +3282,7 @@ impl Session {
         let store = self.output_artifact_store().await;
         let projector = crate::tool_output::ToolOutputProjector::new(
             store,
-            turn_context.model_info.truncation_policy.into(),
+            turn_context.tool_output_truncation_policy(),
         )
         .with_spilling_supported(self.output_artifact_spilling_supported());
         let mut projected_items = Vec::with_capacity(raw_items.len());
@@ -3322,7 +3322,7 @@ impl Session {
                 .note_recorded_items(&response_items);
             state
                 .history
-                .record_annotated_items(&items, turn_context.model_info().truncation_policy.into());
+                .record_annotated_items(&items, turn_context.tool_output_truncation_policy());
         }
         for image in image_preparations {
             self.services

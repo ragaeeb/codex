@@ -8,6 +8,14 @@ use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::turn_context::TurnContext;
 use crate::utils::json::serialized_json_bytes;
+use crate::tool_output::MAX_CONTENT_ITEMS_MODEL_BYTES;
+use crate::tool_output::MAX_CONTENT_ITEMS_SERIALIZED_BYTES;
+use crate::tool_output::MAX_MANAGED_ARTIFACT_MODEL_BYTES;
+use crate::tool_output::MODEL_ITEM_CONTROL_RESERVATION_BYTES;
+use crate::tool_output::bounded_output_payload;
+use crate::tool_output::bounded_structured_error;
+use crate::tool_output::compact_store_backed_envelope;
+use crate::tool_output::has_recoverable_output_artifact;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_context_fragments::set_annotated_content;
@@ -43,6 +51,9 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::LazyLock;
+
+const STORE_BACKED_MEDIA_OMITTED_MARKER: &str =
+    "[omitted media content to stay within the model budget]";
 
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
@@ -198,22 +209,26 @@ impl ContextManager {
 
             let store_backed =
                 metadata.is_some_and(CodexHarnessMetadata::is_store_backed_tool_output);
+            let processed_item = if store_backed
+                && matches!(
+                    item,
+                    ResponseItem::FunctionCallOutput { output, .. }
+                        | ResponseItem::CustomToolCallOutput { output, .. }
+                        if matches!(&output.body, FunctionCallOutputBody::Text(text) if text.len() <= STORE_BACKED_TOOL_OUTPUT_MAX_BYTES && text.len() <= policy.byte_budget().min(MAX_MANAGED_ARTIFACT_MODEL_BYTES))
+                ) {
+                item.clone()
+            } else if store_backed {
+                Self::process_store_backed_item(item, policy)
+                    .unwrap_or_else(|| Self::process_item(item, policy))
+            } else {
+                Self::process_item(item, policy)
+            };
+            let metadata = metadata
+                .filter(|_| !store_backed || has_recoverable_output_artifact(&processed_item))
+                .cloned();
             let processed = ResponseItemEnvelope {
-                item: if store_backed
-                    && matches!(
-                        item,
-                        ResponseItem::FunctionCallOutput { output, .. }
-                            | ResponseItem::CustomToolCallOutput { output, .. }
-                            if matches!(&output.body, FunctionCallOutputBody::Text(text) if text.len() <= STORE_BACKED_TOOL_OUTPUT_MAX_BYTES)
-                    ) {
-                    item.clone()
-                } else if store_backed {
-                    Self::process_store_backed_content_item(item, policy)
-                        .unwrap_or_else(|| Self::process_item(item, policy))
-                } else {
-                    Self::process_item(item, policy)
-                },
-                metadata: metadata.cloned(),
+                item: processed_item,
+                metadata,
             };
             Arc::make_mut(&mut self.items).push(processed);
         }
@@ -548,6 +563,36 @@ impl ContextManager {
         let FunctionCallOutputBody::ContentItems(items) = &mut output.body else {
             return None;
         };
+        let control_text = items.iter().find_map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text }
+                if text != STORE_BACKED_MEDIA_OMITTED_MARKER
+                    && compact_store_backed_envelope(text, usize::MAX).is_some() =>
+            {
+                Some(text.as_str())
+            }
+            _ => None,
+        });
+        let control_count = items
+            .iter()
+            .filter(|item| {
+                matches!(item, FunctionCallOutputContentItem::InputText { text }
+                    if text != STORE_BACKED_MEDIA_OMITTED_MARKER
+                        && compact_store_backed_envelope(text, usize::MAX).is_some())
+            })
+            .count();
+        if control_count != 1
+            || control_text.is_none()
+            || items.iter().any(|item| {
+                matches!(item, FunctionCallOutputContentItem::InputText { text }
+                    if text != STORE_BACKED_MEDIA_OMITTED_MARKER
+                        && Some(text.as_str()) != control_text)
+            })
+        {
+            // Store-backed content-item metadata describes one canonical text control. Mixed or
+            // legacy siblings must lose the sidecar instead of being independently bounded under
+            // an item-wide provenance claim.
+            return None;
+        }
         let text_bytes = items
             .iter()
             .filter_map(|item| match item {
@@ -557,6 +602,20 @@ impl ContextManager {
             .try_fold(0usize, usize::checked_add)?;
         if text_bytes > STORE_BACKED_TOOL_OUTPUT_MAX_BYTES {
             return None;
+        }
+
+        let policy_bytes = policy.byte_budget().min(MAX_MANAGED_ARTIFACT_MODEL_BYTES);
+        for item in items.iter_mut() {
+            let FunctionCallOutputContentItem::InputText { text } = item else {
+                continue;
+            };
+            if text == STORE_BACKED_MEDIA_OMITTED_MARKER {
+                continue;
+            }
+            if text.len() > policy_bytes {
+                *text = compact_store_backed_envelope(text, policy_bytes)
+                    .unwrap_or_else(|| bounded_structured_error(policy_bytes));
+            }
         }
 
         let policy = policy * 1.2;
@@ -592,7 +651,170 @@ impl ContextManager {
             | FunctionCallOutputContentItem::InputImage { .. }
             | FunctionCallOutputContentItem::EncryptedContent { .. } => true,
         });
+
+        // A store-backed marker is one model-visible item. The aggregate body, including media
+        // siblings, must fit the same policy; otherwise independently bounded siblings could
+        // still bypass the item cap. Keep the canonical control when possible and drop only the
+        // non-text siblings that caused the overflow.
+        let aggregate_limit = policy.byte_budget().min(MAX_CONTENT_ITEMS_MODEL_BYTES);
+        let aggregate_item = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_content_items(items.clone()),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let aggregate_exceeds = items.len() > 64
+            || serde_json::to_string(&aggregate_item).map_or(true, |serialized| {
+                serialized.len() > MAX_CONTENT_ITEMS_SERIALIZED_BYTES
+            })
+            || estimate_response_item_model_visible_bytes(&aggregate_item)
+                .try_into()
+                .map_or(true, |bytes: usize| bytes > aggregate_limit);
+        if aggregate_exceeds {
+            let control = items.iter().find_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text.clone()),
+                _ => None,
+            })?;
+            let retained = Self::fit_store_backed_media_items(items, control, aggregate_limit);
+            output.body = FunctionCallOutputBody::ContentItems(retained);
+        }
         Some(item)
+    }
+
+    fn fit_store_backed_media_items(
+        items: &[FunctionCallOutputContentItem],
+        control: String,
+        policy_bytes: usize,
+    ) -> Vec<FunctionCallOutputContentItem> {
+        let control = if let Some(candidate) = compact_store_backed_envelope(
+            &control,
+            policy_bytes.saturating_sub(MODEL_ITEM_CONTROL_RESERVATION_BYTES),
+        ) {
+            candidate
+        } else {
+            control
+        };
+        let control_item = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: control.clone(),
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        if usize::try_from(estimate_response_item_model_visible_bytes(&control_item))
+            .unwrap_or(usize::MAX)
+            > policy_bytes
+            || serde_json::to_string(&control_item).map_or(true, |serialized| {
+                serialized.len() > MAX_CONTENT_ITEMS_SERIALIZED_BYTES
+            })
+        {
+            return vec![FunctionCallOutputContentItem::InputText {
+                text: bounded_structured_error(policy_bytes),
+            }];
+        }
+        let mut retained = vec![FunctionCallOutputContentItem::InputText { text: control }];
+        let mut omitted = items.iter().any(|item| {
+            matches!(item, FunctionCallOutputContentItem::InputText { text }
+                if text == STORE_BACKED_MEDIA_OMITTED_MARKER)
+        });
+        for item in items {
+            if matches!(item, FunctionCallOutputContentItem::InputText { .. }) {
+                continue;
+            }
+            if retained.len() >= 64 {
+                omitted = true;
+                continue;
+            }
+            let mut candidate = retained.clone();
+            candidate.push(item.clone());
+            let candidate_item = ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: None,
+                name: None,
+                namespace: None,
+                output: FunctionCallOutputPayload::from_content_items(candidate.clone()),
+                internal_chat_message_metadata_passthrough: None,
+            };
+            if usize::try_from(estimate_response_item_model_visible_bytes(&candidate_item))
+                .unwrap_or(usize::MAX)
+                <= policy_bytes
+                && serde_json::to_string(&candidate_item).map_or(true, |serialized| {
+                    serialized.len() <= MAX_CONTENT_ITEMS_SERIALIZED_BYTES
+                })
+            {
+                retained.push(item.clone());
+            } else {
+                omitted = true;
+            }
+        }
+        if omitted {
+            if retained.len() >= 64
+                && let Some(index) = retained
+                    .iter()
+                    .rposition(|item| {
+                        !matches!(item, FunctionCallOutputContentItem::InputText { .. })
+                    })
+                    .or_else(|| retained.len().checked_sub(1))
+            {
+                retained.remove(index);
+            }
+            if retained.len() < 64 {
+                let marker = FunctionCallOutputContentItem::InputText {
+                    text: STORE_BACKED_MEDIA_OMITTED_MARKER.to_string(),
+                };
+                let mut candidate = retained.clone();
+                candidate.push(marker.clone());
+                let candidate_item = ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: None,
+                    name: None,
+                    namespace: None,
+                    output: FunctionCallOutputPayload::from_content_items(candidate),
+                    internal_chat_message_metadata_passthrough: None,
+                };
+                if usize::try_from(estimate_response_item_model_visible_bytes(&candidate_item))
+                    .unwrap_or(usize::MAX)
+                    <= policy_bytes
+                    && serde_json::to_string(&candidate_item).map_or(true, |serialized| {
+                        serialized.len() <= MAX_CONTENT_ITEMS_SERIALIZED_BYTES
+                    })
+                {
+                    retained.push(marker);
+                }
+            }
+        }
+        retained
+    }
+
+    fn process_store_backed_item(
+        item: &ResponseItem,
+        policy: TruncationPolicy,
+    ) -> Option<ResponseItem> {
+        if let ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } = item
+            && let FunctionCallOutputBody::Text(text) = &output.body
+            && text.len() > policy.byte_budget().min(MAX_MANAGED_ARTIFACT_MODEL_BYTES)
+        {
+            let policy_bytes = policy.byte_budget().min(MAX_MANAGED_ARTIFACT_MODEL_BYTES);
+            let bounded = compact_store_backed_envelope(text, policy_bytes)
+                .unwrap_or_else(|| bounded_structured_error(policy_bytes));
+            let mut item = item.clone();
+            let output = match &mut item {
+                ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. } => output,
+                _ => return None,
+            };
+            output.body = FunctionCallOutputBody::Text(bounded);
+            return Some(item);
+        }
+        Self::process_store_backed_content_item(item, policy)
     }
 
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.
@@ -647,19 +869,121 @@ pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
 ) -> FunctionCallOutputPayload {
+    if policy.byte_budget() < crate::tool_output::MIN_ARTIFACT_ENVELOPE_BYTES
+        && let FunctionCallOutputBody::Text(text) = &output.body
+    {
+        if text.len() <= policy.byte_budget() {
+            return output.clone();
+        }
+        return bounded_output_payload(output, policy.byte_budget());
+    }
     let body = match &output.body {
         FunctionCallOutputBody::Text(content) => {
             FunctionCallOutputBody::Text(truncate_text(content, policy))
         }
-        FunctionCallOutputBody::ContentItems(items) => FunctionCallOutputBody::ContentItems(
-            truncate_function_output_items_with_policy(items, policy, estimate_audio_token_count),
-        ),
+        FunctionCallOutputBody::ContentItems(items) => {
+            let truncated = truncate_function_output_items_with_policy(
+                items,
+                policy,
+                estimate_audio_token_count,
+            );
+            let bounded = bound_content_items_to_model_budget(
+                &truncated,
+                output.success,
+                policy.byte_budget().min(MAX_MANAGED_ARTIFACT_MODEL_BYTES),
+                policy.byte_budget().min(MAX_CONTENT_ITEMS_MODEL_BYTES),
+            );
+            if bounded.is_empty() && !truncated.is_empty() {
+                FunctionCallOutputBody::Text(bounded_structured_error(policy.byte_budget()))
+            } else {
+                FunctionCallOutputBody::ContentItems(bounded)
+            }
+        }
     };
 
     FunctionCallOutputPayload {
         body,
         success: output.success,
     }
+}
+
+fn bound_content_items_to_model_budget(
+    items: &[FunctionCallOutputContentItem],
+    success: Option<bool>,
+    text_limit: usize,
+    aggregate_limit: usize,
+) -> Vec<FunctionCallOutputContentItem> {
+    let mut retained = Vec::with_capacity(items.len().min(64));
+    let mut omitted = false;
+    for item in items {
+        if retained.len() >= 64 {
+            omitted = true;
+            continue;
+        }
+        let item = match item {
+            FunctionCallOutputContentItem::InputText { text } if text.len() > text_limit => {
+                FunctionCallOutputContentItem::InputText {
+                    text: truncate_text(text, TruncationPolicy::Bytes(text_limit)),
+                }
+            }
+            _ => item.clone(),
+        };
+        let mut candidate = retained.clone();
+        candidate.push(item.clone());
+        let candidate_item = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(candidate),
+                success,
+            },
+            internal_chat_message_metadata_passthrough: None,
+        };
+        if usize::try_from(estimate_response_item_model_visible_bytes(&candidate_item))
+            .unwrap_or(usize::MAX)
+            <= aggregate_limit
+            && serde_json::to_string(&candidate_item).map_or(true, |serialized| {
+                serialized.len() <= MAX_CONTENT_ITEMS_SERIALIZED_BYTES
+            })
+        {
+            retained.push(item.clone());
+        } else {
+            omitted = true;
+        }
+    }
+    if omitted {
+        if retained.len() >= 64 {
+            retained.pop();
+        }
+        let marker = FunctionCallOutputContentItem::InputText {
+            text: STORE_BACKED_MEDIA_OMITTED_MARKER.to_string(),
+        };
+        let mut candidate = retained.clone();
+        candidate.push(marker.clone());
+        let candidate_item = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(candidate),
+                success,
+            },
+            internal_chat_message_metadata_passthrough: None,
+        };
+        if usize::try_from(estimate_response_item_model_visible_bytes(&candidate_item))
+            .unwrap_or(usize::MAX)
+            <= aggregate_limit
+            && serde_json::to_string(&candidate_item).map_or(true, |serialized| {
+                serialized.len() <= MAX_CONTENT_ITEMS_SERIALIZED_BYTES
+            })
+        {
+            retained.push(marker);
+        }
+    }
+    retained
 }
 
 /// API messages include every non-system item (user/assistant messages, reasoning,
@@ -852,27 +1176,41 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
 pub(crate) fn estimate_image_bytes(image_url: &str, detail: Option<ImageDetail>) -> i64 {
     match detail {
         Some(ImageDetail::Original) => {
-            estimate_original_image_bytes(image_url).unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)
+            estimate_original_image_bytes(image_url).unwrap_or_else(|| {
+                if is_image_source_url(image_url) {
+                    i64::try_from(approx_bytes_for_tokens(ORIGINAL_IMAGE_MAX_PATCHES))
+                        .unwrap_or(i64::MAX)
+                } else {
+                    RESIZED_IMAGE_BYTES_ESTIMATE
+                }
+            })
         }
         _ => RESIZED_IMAGE_BYTES_ESTIMATE,
     }
 }
 
-/// Scans one response item for discount-eligible inline image data URLs and
-/// returns:
+/// Scans one response item for image inputs and returns:
 /// - total base64 payload bytes to subtract from raw serialized size
-/// - total replacement byte estimate for those images
+/// - total modality replacement byte estimate for those images
 fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
     let mut payload_bytes = 0i64;
     let mut replacement_bytes = 0i64;
 
     let mut accumulate = |image_url: &str, detail: Option<ImageDetail>| {
-        if let Some(payload_len) = parse_base64_image_data_url(image_url).map(str::len) {
+        let payload_len = parse_base64_image_data_url(image_url).map(str::len);
+        let is_image_source = is_image_source_url(image_url);
+        let estimate = match detail {
+            Some(ImageDetail::Original) => is_image_source.then(|| estimate_image_bytes(image_url, detail)),
+            _ => is_image_source.then_some(RESIZED_IMAGE_BYTES_ESTIMATE),
+        };
+        let Some(estimate) = estimate else {
+            return;
+        };
+        if let Some(payload_len) = payload_len {
             payload_bytes =
                 payload_bytes.saturating_add(i64::try_from(payload_len).unwrap_or(i64::MAX));
-            replacement_bytes =
-                replacement_bytes.saturating_add(estimate_image_bytes(image_url, detail));
         }
+        replacement_bytes = replacement_bytes.saturating_add(estimate);
     };
 
     match item {
@@ -899,6 +1237,21 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
     }
 
     (payload_bytes, replacement_bytes)
+}
+
+fn is_image_source_url(url: &str) -> bool {
+    let Some(prefix) = url.get(.."data:".len()) else {
+        return true;
+    };
+    if !prefix.eq_ignore_ascii_case("data:") {
+        return true;
+    }
+    let data = &url["data:".len()..];
+    let metadata = data.split_once(',').map_or(data, |(metadata, _)| metadata);
+    metadata.split(';').next().is_some_and(|mime| {
+        mime.get(.."image/".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    })
 }
 
 /// Scans one response item for inline base64 audio data URLs and returns:

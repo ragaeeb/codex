@@ -14,6 +14,7 @@ use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 #[cfg(test)]
 use crate::tools::spec_plan::finalize_tool_router;
+use codex_otel::ToolResultLogPolicy;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
 use codex_tools::DiscoverableTool;
@@ -58,7 +59,11 @@ impl ToolCall {
 pub(crate) fn tool_log_payload<'a>(
     payload: &'a ToolPayload,
     source: &ToolCallSource,
+    policy: ToolResultLogPolicy,
 ) -> Cow<'a, str> {
+    if matches!(policy, ToolResultLogPolicy::ContentFree { .. }) {
+        return Cow::Borrowed("[content-free tool arguments]");
+    }
     if matches!(source, ToolCallSource::DirectPlaintextMessage) {
         return Cow::Borrowed("[plaintext arguments]");
     }
@@ -144,6 +149,13 @@ impl ToolRouter {
         self.registry.tool(&call.tool_name)
     }
 
+    pub(crate) fn tool_result_log_policy(&self, call: &ToolCall) -> ToolResultLogPolicy {
+        self.tool_runtime(call)
+            .map_or(ToolResultLogPolicy::Standard, |runtime| {
+                runtime.tool_result_log_policy()
+            })
+    }
+
     pub fn tool_waits_for_runtime_cancellation(&self, call: &ToolCall) -> bool {
         self.registry
             .waits_for_runtime_cancellation(&call.tool_name)
@@ -206,7 +218,11 @@ impl ToolRouter {
     }
 
     #[allow(dead_code)]
-    #[instrument(level = "trace", skip_all, err)]
+    #[instrument(
+        level = "trace",
+        skip_all,
+        fields(error = tracing::field::Empty)
+    )]
     pub async fn dispatch_tool_call_with_code_mode_result(
         &self,
         session: Arc<Session>,
@@ -216,19 +232,37 @@ impl ToolRouter {
         call: ToolCall,
         source: ToolCallSource,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_tool_call_with_code_mode_result_inner(
-            session,
-            step_context,
-            cancellation_token,
-            tracker,
-            call,
-            source,
-            /*terminal_outcome_reached*/ None,
-        )
-        .await
+        let log_policy = self.tool_result_log_policy(&call);
+        let result = self
+            .dispatch_tool_call_with_code_mode_result_inner(
+                session,
+                step_context,
+                cancellation_token,
+                tracker,
+                call,
+                source,
+                /*terminal_outcome_reached*/ None,
+            )
+            .await;
+        if let Err(error) = &result {
+            match log_policy {
+                ToolResultLogPolicy::ContentFree { .. } => {
+                    tracing::Span::current()
+                        .record("error", tracing::field::display("content_free_tool_error"));
+                }
+                ToolResultLogPolicy::Standard => {
+                    tracing::Span::current().record("error", tracing::field::display(error));
+                }
+            }
+        }
+        result
     }
 
-    #[instrument(level = "trace", skip_all, err)]
+    #[instrument(
+        level = "trace",
+        skip_all,
+        fields(error = tracing::field::Empty)
+    )]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_tool_call_with_terminal_outcome(
         &self,
@@ -240,16 +274,30 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Arc<AtomicBool>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_tool_call_with_code_mode_result_inner(
-            session,
-            step_context,
-            cancellation_token,
-            tracker,
-            call,
-            source,
-            Some(terminal_outcome_reached),
-        )
-        .await
+        let log_policy = self.tool_result_log_policy(&call);
+        let result = self
+            .dispatch_tool_call_with_code_mode_result_inner(
+                session,
+                step_context,
+                cancellation_token,
+                tracker,
+                call,
+                source,
+                Some(terminal_outcome_reached),
+            )
+            .await;
+        if let Err(error) = &result {
+            match log_policy {
+                ToolResultLogPolicy::ContentFree { .. } => {
+                    tracing::Span::current()
+                        .record("error", tracing::field::display("content_free_tool_error"));
+                }
+                ToolResultLogPolicy::Standard => {
+                    tracing::Span::current().record("error", tracing::field::display(error));
+                }
+            }
+        }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -11,18 +11,22 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::CompactionTraceContext;
+use codex_utils_output_truncation::OutputArtifactId;
 use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
     pub(super) prompt_input: Vec<ResponseItem>,
     pub(super) prompt_input_metadata: Vec<Option<CodexHarnessMetadata>>,
+    pub(super) artifact_controls: Vec<ResponseItemEnvelope>,
+    pub(super) artifact_reference_ids: Vec<OutputArtifactId>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
@@ -40,6 +44,13 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
+    // Context-pressure rewriting may replace a managed output with a generic marker. Snapshot
+    // trusted controls and sidecar references first so remote v2 compaction cannot erase the only
+    // recovery path before the replacement history is built.
+    let artifact_controls =
+        crate::tool_output::artifact_controls_for_compaction(history.annotated_items());
+    let artifact_reference_ids =
+        crate::tool_output::referenced_output_artifact_ids(history.annotated_items());
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
             &mut history,
@@ -136,6 +147,8 @@ pub(super) async fn run_remote_compact_v2_attempt(
         trace_input_history,
         prompt_input,
         prompt_input_metadata,
+        artifact_controls,
+        artifact_reference_ids,
         compaction_output,
         token_usage,
         owned_client_session,

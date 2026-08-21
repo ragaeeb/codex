@@ -31,6 +31,7 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::util::error_or_panic;
 use codex_analytics::ControlToolCallStatus;
 use codex_extension_api::ToolCallOutcome;
+use codex_otel::ToolResultLogPolicy;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::parse_command::ParsedCommand;
@@ -54,6 +55,14 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// Classifies whether this trusted runtime may emit model data to telemetry.
+    ///
+    /// External runtimes keep the standard policy even when they happen to use
+    /// the same leaf tool name as a native handler.
+    fn tool_result_log_policy(&self) -> ToolResultLogPolicy {
+        ToolResultLogPolicy::Standard
+    }
+
     /// Whether this built-in control tool needs a structured tool-call event.
     fn is_builtin_control_tool(&self) -> bool {
         false
@@ -534,11 +543,16 @@ impl ToolRegistry {
             Some(tool) => tool,
             None => {
                 let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
-                let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
-                otel.tool_result_with_tags(
+                let log_payload = tool_log_payload(
+                    &invocation.payload,
+                    &invocation.source,
+                    ToolResultLogPolicy::Standard,
+                );
+                otel.tool_result_with_policy(
                     &tool_name,
                     &call_id_owned,
                     log_payload.as_ref(),
+                    ToolResultLogPolicy::Standard,
                     Duration::ZERO,
                     /*success*/ false,
                     &message,
@@ -550,6 +564,7 @@ impl ToolRegistry {
                 return Err(err);
             }
         };
+        let log_policy = tool.tool_result_log_policy();
         let telemetry_tags = tool.telemetry_tags(&invocation);
         let mut tool_result_tags =
             Vec::with_capacity(base_tool_result_tags.len() + telemetry_tags.len() + 1);
@@ -564,11 +579,12 @@ impl ToolRegistry {
         }
         if !tool.matches_kind(&invocation.payload) {
             let message = format!("tool {tool_name} invoked with incompatible payload");
-            let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
-            otel.tool_result_with_tags(
+            let log_payload = tool_log_payload(&invocation.payload, &invocation.source, log_policy);
+            otel.tool_result_with_policy(
                 &tool_name,
                 &call_id_owned,
                 log_payload.as_ref(),
+                log_policy,
                 Duration::ZERO,
                 /*success*/ false,
                 &message,
@@ -655,13 +671,14 @@ impl ToolRegistry {
             tool_result_tags.push(("command_category", category));
         }
 
-        let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
+        let log_payload = tool_log_payload(&invocation.payload, &invocation.source, log_policy);
 
         let result = otel
-            .log_tool_result_with_tags(
+            .log_tool_result_with_policy(
                 &tool_name,
                 &call_id_owned,
                 log_payload.as_ref(),
+                log_policy,
                 &tool_result_tags,
                 &extra_trace_fields,
                 || handle_any_tool(tool.as_ref(), invocation.clone()),

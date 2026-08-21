@@ -35,6 +35,24 @@ fn response_item_envelope_accessors_preserve_item() {
 }
 
 #[test]
+fn artifact_reference_metadata_is_bounded_at_the_history_boundary() {
+    let metadata = CodexHarnessMetadata::default().with_store_backed_artifact_references(
+        (0..(MAX_STORE_BACKED_ARTIFACT_REFERENCES + 32)).map(|index| format!("out_{index:064x}")),
+    );
+    assert_eq!(
+        metadata.store_backed_artifact_references().len(),
+        MAX_STORE_BACKED_ARTIFACT_REFERENCES
+    );
+
+    let serialized = serde_json::to_value(&metadata).expect("metadata should serialize");
+    let restored: CodexHarnessMetadata = serde_json::from_value(serialized).expect("metadata");
+    assert_eq!(
+        restored.store_backed_artifact_references().len(),
+        MAX_STORE_BACKED_ARTIFACT_REFERENCES
+    );
+}
+
+#[test]
 /// Keeps legacy response-item rollout lines readable and byte-shape compatible.
 fn response_item_rollout_line_preserves_shape() -> Result<()> {
     let legacy_line = json!({

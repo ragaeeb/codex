@@ -2,13 +2,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::function_tool::FunctionCallError;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::McpHandler;
+use crate::tools::handlers::read_file::ReadFileHandler;
+use crate::tools::handlers::read_tool_output::ReadToolOutputHandler;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::RegisteredTool;
 use crate::tools::registry::ToolExposure;
+use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::append_source_tools;
 use crate::tools::spec_plan::build_core_tool_registry;
 use crate::tools::spec_plan::extension_tool_executors;
@@ -19,6 +24,8 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ResponsesApiTool;
 use codex_extension_api::ToolCall as ExtensionToolCall;
 use codex_extension_api::ToolExecutor;
+use codex_otel::OtelProvider;
+use codex_otel::ToolResultLogPolicy;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -28,15 +35,25 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::default_namespace_description;
 use core_test_support::responses::strip_response_item_ids_from_json;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_sdk::logs::InMemoryLogExporter;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::trace::InMemorySpanExporter;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::layer::SubscriberExt;
 
 use super::ToolCall;
 use super::ToolCallSource;
@@ -45,19 +62,340 @@ use super::tool_log_payload;
 
 struct ExtensionEchoContributor;
 
+struct StandardErrorHandler;
+
+impl codex_tools::ToolExecutor<ToolInvocation> for StandardErrorHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("standard_error")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: "standard_error".to_string(),
+            description: "test standard error tool".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::object(BTreeMap::new(), Some(Vec::new()), Some(false.into())),
+            output_schema: None,
+        })
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Err(FunctionCallError::RespondToModel(
+                "STANDARD_ROUTER_ERROR_DIAGNOSTIC".to_string(),
+            ))
+        })
+    }
+}
+
+impl CoreToolRuntime for StandardErrorHandler {}
+
 #[test]
 fn tool_log_payload_redacts_plaintext_multi_agent_messages() {
     let payload = ToolPayload::Function {
         arguments: json!({"target": "/root/worker", "message": "secret message"}).to_string(),
     };
     assert_eq!(
-        tool_log_payload(&payload, &ToolCallSource::DirectPlaintextMessage),
+        tool_log_payload(
+            &payload,
+            &ToolCallSource::DirectPlaintextMessage,
+            ToolResultLogPolicy::Standard,
+        ),
         "[plaintext arguments]"
     );
     assert_eq!(
-        tool_log_payload(&payload, &ToolCallSource::Direct),
+        tool_log_payload(
+            &payload,
+            &ToolCallSource::Direct,
+            ToolResultLogPolicy::Standard,
+        ),
         payload.log_payload()
     );
+}
+
+#[test]
+fn tool_log_payload_redacts_only_content_free_native_tools() {
+    let payload = ToolPayload::Function {
+        arguments: r#"{"path":"secret.txt","environment_id":"secret-env"}"#.into(),
+    };
+    assert_eq!(
+        tool_log_payload(
+            &payload,
+            &ToolCallSource::Direct,
+            ToolResultLogPolicy::ContentFree {
+                tool_family: "read_file",
+            },
+        ),
+        "[content-free tool arguments]"
+    );
+    assert_eq!(
+        tool_log_payload(
+            &payload,
+            &ToolCallSource::Direct,
+            ToolResultLogPolicy::Standard,
+        ),
+        payload.log_payload()
+    );
+}
+
+#[tokio::test]
+async fn native_read_file_router_error_span_is_content_free() -> anyhow::Result<()> {
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let tracer = tracer_provider.tracer("native-read-file-router-test");
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(filter_fn(OtelProvider::trace_export_filter)),
+    );
+
+    let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let handler = Arc::new(ReadFileHandler::new(/*include_environment_id*/ false));
+    let router = ToolRouter::from_parts(
+        ToolRegistry::with_handler_for_test(Arc::clone(&handler)),
+        vec![handler.spec()],
+    );
+    let call = ToolCall {
+        tool_name: ToolName::plain("read_file"),
+        call_id: "native-read-file-error".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({"path": "SECRET_NATIVE_READ_FILE_PATH"}).to_string(),
+        },
+        encrypted_function_args: None,
+    };
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let result = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        router
+            .dispatch_tool_call_with_code_mode_result(
+                Arc::new(session),
+                step_context,
+                CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call,
+                ToolCallSource::Direct,
+            )
+            .await
+    };
+    assert!(result.is_err());
+    tracer_provider.force_flush()?;
+
+    let spans = span_exporter.get_finished_spans()?;
+    let rendered = spans
+        .iter()
+        .map(|span| format!("{:?}{:?}", span.attributes, span.events.events))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("SECRET_NATIVE_READ_FILE_PATH"));
+    assert!(rendered.contains("content_free_tool_error"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_read_tools_route_actual_success_and_error_spans_content_free() -> anyhow::Result<()>
+{
+    let log_exporter = InMemoryLogExporter::default();
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(log_exporter.clone())
+        .build();
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let tracer = tracer_provider.tracer("native-read-tools-router-test");
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            OpenTelemetryTracingBridge::new(&logger_provider)
+                .with_filter(filter_fn(OtelProvider::log_export_filter)),
+        )
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(filter_fn(OtelProvider::trace_export_filter)),
+        );
+
+    let (session, turn) = make_session_and_context().await;
+    let artifact = session
+        .output_artifact_store()
+        .await
+        .store_text("SECRET_ARTIFACT_CONTENT")
+        .await?;
+    let turn = Arc::new(turn);
+    let session = Arc::new(session);
+    let read_file = Arc::new(ReadFileHandler::new(/*include_environment_id*/ false));
+    let read_tool_output = Arc::new(ReadToolOutputHandler);
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_tools([
+            Arc::clone(&read_file) as Arc<dyn CoreToolRuntime>,
+            Arc::clone(&read_tool_output) as Arc<dyn CoreToolRuntime>,
+        ]),
+        vec![read_file.spec(), read_tool_output.spec()],
+    );
+
+    let calls = [
+        (
+            true,
+            ToolCall {
+                tool_name: ToolName::plain("read_tool_output"),
+                call_id: "native-read-tool-output-success".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({
+                        "artifact_id": artifact.id.as_str(),
+                        "mode": "bytes",
+                        "limit": 512,
+                    })
+                    .to_string(),
+                },
+                encrypted_function_args: None,
+            },
+        ),
+        (
+            false,
+            ToolCall {
+                tool_name: ToolName::plain("read_file"),
+                call_id: "native-read-file-error".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({"path": "SECRET_NATIVE_READ_FILE_PATH"}).to_string(),
+                },
+                encrypted_function_args: None,
+            },
+        ),
+        (
+            false,
+            ToolCall {
+                tool_name: ToolName::plain("read_tool_output"),
+                call_id: "native-read-tool-output-error".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({"artifact_id": "SECRET_ARTIFACT_ID"}).to_string(),
+                },
+                encrypted_function_args: None,
+            },
+        ),
+    ];
+
+    let dispatch = tracing::Dispatch::new(subscriber);
+    {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        for (index, (expected_success, call)) in calls.into_iter().enumerate() {
+            let result =
+                dispatch_router_test_call(&router, Arc::clone(&session), Arc::clone(&turn), call)
+                    .await;
+            if result.is_ok() != expected_success {
+                panic!("unexpected result for call {index}: {:?}", result.err());
+            }
+        }
+    }
+    tracer_provider.force_flush()?;
+
+    let spans = span_exporter.get_finished_spans()?;
+    let rendered = spans
+        .iter()
+        .map(|span| format!("{:?}{:?}", span.attributes, span.events.events))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for secret in [
+        "SECRET_ARTIFACT_CONTENT",
+        "SECRET_NATIVE_READ_FILE_PATH",
+        "SECRET_ARTIFACT_ID",
+    ] {
+        assert!(!rendered.contains(secret), "span telemetry leaked {secret}");
+    }
+    assert!(rendered.contains("codex.tool_result"));
+    assert!(rendered.contains("output_length"));
+    assert!(rendered.contains("content_free_tool_error"));
+
+    logger_provider.force_flush()?;
+    let logs = log_exporter.get_emitted_logs()?;
+    let log_text = logs
+        .iter()
+        .map(|log| format!("{:?}", log.record))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for secret in [
+        "SECRET_ARTIFACT_CONTENT",
+        "SECRET_NATIVE_READ_FILE_PATH",
+        "SECRET_ARTIFACT_ID",
+    ] {
+        assert!(!log_text.contains(secret), "log telemetry leaked {secret}");
+    }
+    assert!(log_text.contains("content-free tool arguments"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_router_error_span_preserves_the_diagnostic() -> anyhow::Result<()> {
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let tracer = tracer_provider.tracer("standard-router-error-test");
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(filter_fn(OtelProvider::trace_export_filter)),
+    );
+    let (session, turn) = make_session_and_context().await;
+    let handler = Arc::new(StandardErrorHandler);
+    let router = ToolRouter::from_parts(
+        ToolRegistry::with_handler_for_test(Arc::clone(&handler)),
+        vec![handler.spec()],
+    );
+    let call = ToolCall {
+        tool_name: ToolName::plain("standard_error"),
+        call_id: "standard-error-call".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+        encrypted_function_args: None,
+    };
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let result = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        router
+            .dispatch_tool_call_with_code_mode_result(
+                Arc::new(session),
+                StepContext::for_test(Arc::new(turn)),
+                CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call,
+                ToolCallSource::Direct,
+            )
+            .await
+    };
+    assert!(result.is_err());
+    tracer_provider.force_flush()?;
+    let rendered = span_exporter
+        .get_finished_spans()?
+        .iter()
+        .map(|span| format!("{:?}{:?}", span.attributes, span.events.events))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("STANDARD_ROUTER_ERROR_DIAGNOSTIC"));
+    assert!(!rendered.contains("content_free_tool_error"));
+    Ok(())
+}
+
+async fn dispatch_router_test_call(
+    router: &ToolRouter,
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<crate::session::turn_context::TurnContext>,
+    call: ToolCall,
+) -> Result<crate::tools::registry::AnyToolResult, FunctionCallError> {
+    router
+        .dispatch_tool_call_with_code_mode_result(
+            session,
+            StepContext::for_test(turn),
+            CancellationToken::new(),
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call,
+            ToolCallSource::Direct,
+        )
+        .await
 }
 
 impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
