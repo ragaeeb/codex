@@ -42,13 +42,27 @@ impl ToolOutputProjector {
             }),
             FunctionCallOutputBody::Text(_) => false,
         };
+        // A policy below the recovery-control floor must not replace an already-fitting text-only
+        // body merely because the surrounding response-item estimate includes wrapper overhead.
+        let text_only_body_fits_policy = self.policy.byte_budget() < MIN_ARTIFACT_ENVELOPE_BYTES
+            && !has_media
+            && original_bytes <= model_limit
+            && match &payload.body {
+                FunctionCallOutputBody::ContentItems(items) => {
+                    items.len() <= MAX_MODEL_VISIBLE_CONTENT_ITEMS
+                }
+                FunctionCallOutputBody::Text(_) => false,
+            };
         // The hard model-item ceiling is also a recoverability boundary for text. A text-only
         // body that fits the configured policy but exceeds the independent ceiling must take the
         // same store-backed path as any other oversized text, rather than becoming an
         // unrecoverable bounded error.
         let text_exceeds_policy =
             text_bytes > self.policy.byte_budget() || text_bytes > MAX_MANAGED_ARTIFACT_MODEL_BYTES;
-        if !has_media && !text_exceeds_policy && !model_exceeds_policy {
+        if !has_media
+            && !text_exceeds_policy
+            && (text_only_body_fits_policy || !model_exceeds_policy)
+        {
             return (
                 payload.clone(),
                 measurement(

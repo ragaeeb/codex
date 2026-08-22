@@ -144,6 +144,26 @@ async fn invalid_utf8_retrieval_uses_exact_base64_windows_and_byte_search() {
         );
     }
 
+    let bytes = vec![0xc2, 0x80, 0xff];
+    let artifact = store.store_bytes(&bytes).await.expect("store raw artifact");
+    let mut recovered = Vec::new();
+    let mut offset = 0;
+    loop {
+        let value = read_bytes_value(&store, &artifact.id, offset, /*limit*/ 1)
+            .await
+            .expect("one-byte raw pages must remain recoverable");
+        recovered.extend(
+            BASE64_STANDARD
+                .decode(value["bytes_base64"].as_str().expect("base64"))
+                .expect("decode base64"),
+        );
+        let Some(next) = value["next_offset"].as_u64() else {
+            break;
+        };
+        offset = next;
+    }
+    assert_eq!(recovered, bytes);
+
     let bytes = vec![b'a', 0x80, 0xff, b'z'];
     let artifact = store.store_bytes(&bytes).await.expect("store raw artifact");
     let value = read_bytes_value(&store, &artifact.id, /*offset*/ 1, /*limit*/ 2)

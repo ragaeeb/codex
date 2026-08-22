@@ -166,7 +166,12 @@ pub(super) async fn read_bytes_value(
             "next_offset": next,
             "complete": next.is_none(),
         })),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
             let (bytes, start, end, next) = store.read_raw_bytes(id, offset, limit).await?;
             Ok(json!({
                 "type": "tool_output_artifact_window",

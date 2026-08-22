@@ -765,3 +765,32 @@ async fn output_below_the_artifact_minimum_stays_valid_and_untrusted() {
         assert!(projected.metadata.is_none());
     }
 }
+
+#[tokio::test]
+async fn fitting_content_items_stay_unchanged_below_the_artifact_minimum() {
+    let temp = tempdir().expect("tempdir");
+    let original = item(FunctionCallOutputBody::ContentItems(vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "ok".to_string(),
+        },
+    ]));
+    let body_bytes = match &original {
+        ResponseItem::FunctionCallOutput { output, .. } => serde_json::to_string(&output.body)
+            .expect("serialize body")
+            .len(),
+        _ => unreachable!(),
+    };
+    assert!(body_bytes < MIN_ARTIFACT_ENVELOPE_BYTES);
+    for budget in [body_bytes, 64, 128, MIN_ARTIFACT_ENVELOPE_BYTES - 1] {
+        let projector =
+            ToolOutputProjector::new(artifact_store(temp.path()), TruncationPolicy::Bytes(budget));
+
+        let (projected, measurement) = projector.project_response_item(&original).await;
+
+        assert_eq!(projected, ResponseItemEnvelope::new(original.clone()));
+        assert_eq!(
+            measurement.map(|measurement| measurement.rule),
+            Some("inline_v1")
+        );
+    }
+}
