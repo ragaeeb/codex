@@ -593,6 +593,7 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
             ),
         }),
         post_tool_use_payload: None,
+        argument_repair_receipt: None,
     };
 
     let response = result.into_response();
@@ -625,6 +626,7 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
             ),
         }),
         post_tool_use_payload: None,
+        argument_repair_receipt: None,
     };
 
     assert_eq!(

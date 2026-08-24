@@ -53,6 +53,82 @@ fn artifact_reference_metadata_is_bounded_at_the_history_boundary() {
 }
 
 #[test]
+fn argument_repair_receipt_is_bounded_and_kept_outside_raw_item() -> Result<()> {
+    let receipt = ToolArgumentRepairReceipt {
+        tool_family: ToolArgumentRepairToolFamily::ReadFile,
+        outcome: ToolArgumentRepairOutcome::Repaired,
+        rules: (0..(MAX_TOOL_ARGUMENT_REPAIR_RULES + 3))
+            .map(|_| "numeric_string_typed".to_string())
+            .chain(["secret_rule".to_string()])
+            .collect(),
+        input_bytes: MAX_TOOL_ARGUMENT_REPAIR_BYTES + 1,
+        effective_bytes: MAX_TOOL_ARGUMENT_REPAIR_BYTES + 2,
+        candidate_work: usize::MAX,
+        repair_duration_micros: u64::MAX,
+        reason: None,
+    };
+    let raw_item = response_message("user");
+    let line = RolloutLine {
+        timestamp: "2025-01-03T12:00:00.000Z".to_string(),
+        ordinal: Some(8),
+        item: RolloutItem::ResponseItem(ResponseItemEnvelope {
+            item: raw_item.clone(),
+            metadata: Some(CodexHarnessMetadata::default().with_tool_argument_repair(receipt)),
+        }),
+    };
+
+    let mut serialized = serde_json::to_value(&line)?;
+    assert_eq!(serialized["payload"], serde_json::to_value(&raw_item)?);
+    assert_eq!(
+        serialized["metadata"]["tool_argument_repair"]["rules"]
+            .as_array()
+            .expect("serialized rules")
+            .len(),
+        MAX_TOOL_ARGUMENT_REPAIR_RULES
+    );
+    serialized["metadata"]["tool_argument_repair"]["candidate_work"] = json!(usize::MAX);
+    serialized["metadata"]["tool_argument_repair"]["repair_duration_micros"] = json!(u64::MAX);
+    serialized["metadata"]["tool_argument_repair"]["rules"] =
+        json!(["numeric_string_typed", "secret_rule"]);
+    let restored = serde_json::from_value::<RolloutLine>(serialized)?;
+    let RolloutItem::ResponseItem(envelope) = restored.item else {
+        panic!("expected response item");
+    };
+    let receipt = envelope
+        .metadata
+        .expect("repair metadata")
+        .tool_argument_repair()
+        .cloned()
+        .expect("repair receipt");
+    assert_eq!(receipt.rules.len(), 1);
+    assert_eq!(receipt.input_bytes, MAX_TOOL_ARGUMENT_REPAIR_BYTES);
+    assert_eq!(receipt.effective_bytes, MAX_TOOL_ARGUMENT_REPAIR_BYTES);
+    assert_eq!(
+        receipt.candidate_work,
+        MAX_TOOL_ARGUMENT_REPAIR_CANDIDATE_WORK
+    );
+    assert_eq!(
+        receipt.repair_duration_micros,
+        MAX_TOOL_ARGUMENT_REPAIR_DURATION_MICROS
+    );
+    assert_eq!(receipt.rules, ["numeric_string_typed"]);
+    assert_eq!(envelope.item, raw_item);
+    Ok(())
+}
+
+#[test]
+fn argument_repair_receipt_rejects_unbounded_serialized_rule_sequences() {
+    let value = json!({
+        "tool_family": "read_file",
+        "outcome": "repaired",
+        "rules": vec!["numeric_string_typed"; MAX_TOOL_ARGUMENT_REPAIR_RULES + 1],
+    });
+    let error = serde_json::from_value::<ToolArgumentRepairReceipt>(value)
+        .expect_err("oversized persisted rule sequences must fail closed");
+    assert!(error.to_string().contains("invalid length"), "{error}");
+}
+
+#[test]
 /// Keeps legacy response-item rollout lines readable and byte-shape compatible.
 fn response_item_rollout_line_preserves_shape() -> Result<()> {
     let legacy_line = json!({

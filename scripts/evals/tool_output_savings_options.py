@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the live external evaluation (macOS-only; --build required)",
     )
     parser.add_argument(
+        "--stage3",
+        action="store_true",
+        help="run the one paired Stage 3 Luna Code Mode argument-repair lane",
+    )
+    parser.add_argument(
         "--codex-cli",
         type=Path,
         help="repo release executable; use --build for run-built binary evidence",

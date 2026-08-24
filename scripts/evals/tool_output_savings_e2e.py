@@ -8,9 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from tool_output_savings_evidence import HarnessError
-from tool_output_savings_evidence import measure_thread
-from tool_output_savings_evidence import require
+from tool_output_savings_evidence import HarnessError, measure_thread, require
 from tool_output_savings_fixture import build_release
 from tool_output_savings_fixture import cli_version
 from tool_output_savings_fixture import git_commit
@@ -26,9 +24,8 @@ from tool_output_savings_cleanup import delete_thread
 from tool_output_savings_cleanup import resolve_database
 from tool_output_savings_cleanup import verify_thread_deleted
 from tool_output_savings_analysis import analyze
-from tool_output_savings_report import failure_report
+from tool_output_savings_report import failure_report, redacted_report
 from tool_output_savings_report import mark_unattributed_build_provenance
-from tool_output_savings_report import redacted_report
 from tool_output_savings_lifecycle import _cleanup_report
 from tool_output_savings_lifecycle import _remove_fixture
 from tool_output_savings_lifecycle import _write_cleanup_receipt
@@ -41,9 +38,8 @@ from tool_output_savings_fixture import validate_reasoning_effort
 from tool_output_savings_fixture import working_tree_status_digest
 from tool_output_savings_code_mode_build import build_code_mode_release
 from tool_output_savings_code_mode_lane import analyze_code_mode
-from tool_output_savings_options import build_parser
+from tool_output_savings_options import build_parser, resolve_codex_home
 from tool_output_savings_options import evaluation_lane as lane_for_tool_mode
-from tool_output_savings_options import resolve_codex_home
 from tool_output_savings_runtime_provenance import (
     harness_digest as compute_harness_digest,
 )
@@ -56,6 +52,10 @@ CATALOG_PATH = REPO_ROOT / "codex-rs/models-manager/models.json"
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.stage3:
+        from tool_output_savings_stage3_runner import run_stage3_live
+
+        return run_stage3_live(args)
     if not args.live:
         parser.error(
             "--live is required; offline helpers are covered by sibling unittest modules"

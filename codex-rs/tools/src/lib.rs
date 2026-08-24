@@ -1,6 +1,7 @@
 //! Shared tool definitions and Responses API tool primitives that can live
 //! outside `codex-core`.
 
+mod argument_repair;
 mod code_mode;
 mod dynamic_tool;
 mod function_call_error;
@@ -20,6 +21,20 @@ mod tool_payload;
 mod tool_search;
 mod tool_spec;
 
+pub use argument_repair::ArgumentRepairLimit;
+pub use argument_repair::ArgumentRepairLimits;
+pub use argument_repair::ArgumentRepairMetrics;
+pub use argument_repair::ArgumentRepairOutcome;
+pub use argument_repair::ArgumentRepairPolicy;
+pub use argument_repair::ArgumentRepairPolicyError;
+pub use argument_repair::ArgumentRepairRule;
+pub use argument_repair::ArgumentValidationError;
+pub use argument_repair::ArgumentValidationKeyword;
+pub use argument_repair::ArgumentValidationResult;
+pub use argument_repair::ArgumentValidationType;
+pub use argument_repair::UnsupportedSchemaReason;
+pub use argument_repair::validate_and_repair;
+pub use argument_repair::validate_and_repair_with_metrics;
 pub use code_mode::augment_tool_spec_for_code_mode;
 pub use code_mode::code_mode_name_for_tool_name;
 pub use code_mode::collect_code_mode_exec_prompt_tool_definitions;

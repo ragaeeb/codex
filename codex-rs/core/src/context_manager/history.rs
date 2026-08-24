@@ -1200,7 +1200,9 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
         let payload_len = parse_base64_image_data_url(image_url).map(str::len);
         let is_image_source = is_image_source_url(image_url);
         let estimate = match detail {
-            Some(ImageDetail::Original) => is_image_source.then(|| estimate_image_bytes(image_url, detail)),
+            Some(ImageDetail::Original) => {
+                is_image_source.then(|| estimate_image_bytes(image_url, detail))
+            }
             _ => is_image_source.then_some(RESIZED_IMAGE_BYTES_ESTIMATE),
         };
         let Some(estimate) = estimate else {

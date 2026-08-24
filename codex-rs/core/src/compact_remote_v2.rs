@@ -514,7 +514,7 @@ fn build_v2_compacted_history(
         })
         .flat_map(HistoryItemGroup::into_items)
         .collect::<Vec<_>>();
-    let mut retained =
+    let retained =
         truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET, image_budget);
     let mut retained = crate::tool_output::merge_artifact_controls(retained, artifact_controls);
     let retained_image_count = retained
@@ -764,8 +764,8 @@ mod tests {
     use super::*;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ContentItemKind;
-    use codex_protocol::models::InternalChatMessageMetadataPassthrough;
     use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::InternalChatMessageMetadataPassthrough;
     use codex_protocol::models::MessagePhase;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
@@ -969,6 +969,7 @@ mod tests {
             vec![None],
             replacement,
             /*retain_client_developer_messages*/ false,
+            RetainedImageBudget::Disabled,
             controls,
             ids,
         );

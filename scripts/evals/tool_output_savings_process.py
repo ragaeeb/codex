@@ -185,6 +185,8 @@ def run_cli(
     codex_home: Path | None,
     sqlite_home: Path | None,
     timeout: float,
+    tool_argument_repair: bool | None = None,
+    stage3: bool = False,
 ) -> tuple[list[dict[str, Any]], str, dict[str, int], Path, Path]:
     if sys.platform != "darwin":
         raise HarnessError("live_eval_scope_macos_only")
@@ -203,6 +205,8 @@ def run_cli(
         reasoning_effort=reasoning_effort,
         model_tool_mode_value=model_tool_mode_value,
         sqlite_home=sqlite_home,
+        tool_argument_repair=tool_argument_repair,
+        stage3=stage3,
     )
     environment = {
         key: value

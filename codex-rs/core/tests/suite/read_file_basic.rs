@@ -10,7 +10,12 @@ async fn feature_gate_controls_model_visible_read_file_schema() -> Result<()> {
         assistant_response("disabled-response", "disabled-message"),
     )
     .await;
-    let mut disabled_builder = test_codex();
+    let mut disabled_builder = test_codex().with_config(|config| {
+        config
+            .features
+            .disable(Feature::NativeReadFile)
+            .expect("test config should disable native read_file");
+    });
     let disabled = disabled_builder.build_with_auto_env(&server).await?;
     disabled.submit_turn("inspect the available tools").await?;
     let disabled_body = disabled_mock.single_request().body_json();
@@ -73,7 +78,7 @@ async fn read_file_code_mode_returns_a_structured_nested_result() -> Result<()> 
             ev_custom_tool_call(
                 "code-mode-exec",
                 "exec",
-                r#"const first = await tools.read_file({ path: "code-mode.txt", max_bytes: 32768 }); const duplicate = await tools.read_file({ path: "code-mode.txt", max_bytes: 32768 }); text(JSON.stringify({ first, duplicate }));"#,
+                r#"const first = await tools.read_file({ path: "code-mode.txt", max_bytes: 32768 }); const duplicate = await tools.read_file({ path: "code-mode.txt", max_bytes: 32768 }); text(JSON.stringify({ firstType: first.type, duplicateType: duplicate.type, sameText: first.window.text === duplicate.window.text, startsWithMarker: first.window.text.startsWith("structured-code-mode-result-"), firstEndByte: first.window.end_byte, sameNextOffset: first.next_offset === duplicate.next_offset }));"#,
             ),
             ev_completed("code-mode-response"),
         ]),
@@ -88,38 +93,32 @@ async fn read_file_code_mode_returns_a_structured_nested_result() -> Result<()> 
 
     let request = followup_mock.single_request();
     let body = request.custom_tool_call_output("code-mode-exec");
-    let output = body["output"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| {
-            body["output"]
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|item| item["text"].as_str())
-                .map(str::to_string)
-        })
-        .context("Code Mode output should contain text")?;
-    let value: Value = serde_json::from_str(&output)?;
-    assert_eq!(value["first"]["type"], "file_read");
-    assert_eq!(value["duplicate"]["type"], "file_read");
-    assert_eq!(
-        value["first"]["window"]["text"],
-        value["duplicate"]["window"]["text"]
-    );
+    let output = if let Some(output) = body["output"].as_str() {
+        output
+            .split_once("Output:\n")
+            .map_or(output, |(_, output)| output)
+            .to_string()
+    } else {
+        body["output"]
+            .as_array()
+            .context("Code Mode output should contain text")?
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .skip(/*n*/ 1)
+            .collect::<String>()
+    };
+    let value: Value = serde_json::from_str(&output)
+        .with_context(|| format!("Code Mode output should be JSON: {output:?}"))?;
+    assert_eq!(value["firstType"], "file_read", "{value:#}");
+    assert_eq!(value["duplicateType"], "file_read");
+    assert_eq!(value["sameText"], true);
+    assert_eq!(value["startsWithMarker"], true);
     assert!(
-        value["first"]["window"]["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("structured-code-mode-result-"))
-    );
-    assert!(
-        value["first"]["window"]["end_byte"]
+        value["firstEndByte"]
             .as_u64()
             .is_some_and(|end| end <= 8 * 1024)
     );
-    assert_eq!(
-        value["first"]["next_offset"],
-        value["duplicate"]["next_offset"]
-    );
+    assert_eq!(value["sameNextOffset"], true);
     Ok(())
 }
 

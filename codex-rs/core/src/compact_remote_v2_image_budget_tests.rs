@@ -145,9 +145,7 @@ fn image_treatment_preserves_client_developer_boundary_behavior() {
     *role = "developer".to_string();
     let source = ResponseItemEnvelope {
         item,
-        metadata: Some(CodexHarnessMetadata {
-            client_authored: true,
-        }),
+        metadata: Some(CodexHarnessMetadata::client_authored()),
     };
     for max_tokens in [1871, 1879, 1880, 1950, 2200] {
         assert_eq!(

@@ -1,6 +1,7 @@
 use codex_file_system::read_file_snapshot::read_file_snapshot_transaction;
 use codex_otel::ToolResultLogPolicy;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_tools::ArgumentRepairPolicy;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -51,6 +52,7 @@ struct ReadFileArgs {
 
 pub(crate) struct ReadFileHandler {
     spec: Arc<ToolSpec>,
+    argument_repair_policy: ArgumentRepairPolicy,
     code_mode_definitions: OnceLock<Vec<codex_code_mode::ToolDefinition>>,
 }
 
@@ -59,8 +61,14 @@ impl ReadFileHandler {
         let options = ReadFileToolOptions {
             include_environment_id,
         };
+        let mut argument_repair_policy = ArgumentRepairPolicy::default();
+        assert!(
+            argument_repair_policy.allow_markdown_path("/path").is_ok(),
+            "read_file path policy is a valid static pointer"
+        );
         Self {
             spec: Arc::new(create_read_file_tool(options)),
+            argument_repair_policy,
             code_mode_definitions: OnceLock::new(),
         }
     }
@@ -85,6 +93,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
 }
 
 impl CoreToolRuntime for ReadFileHandler {
+    fn argument_repair_policy(&self) -> Option<ArgumentRepairPolicy> {
+        Some(self.argument_repair_policy.clone())
+    }
+
     fn tool_result_log_policy(&self) -> ToolResultLogPolicy {
         ToolResultLogPolicy::ContentFree {
             tool_family: "read_file",

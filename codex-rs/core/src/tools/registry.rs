@@ -38,6 +38,7 @@ use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::state_db;
 use codex_shell_command::parse_command::parse_shell_script;
+use codex_tools::ArgumentRepairPolicy;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use futures::future::BoxFuture;
@@ -55,6 +56,14 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// Returns the conservative argument-repair policy for this trusted runtime.
+    ///
+    /// `None` is an explicit policy miss: generic, dynamic, namespaced, custom, and MCP-backed
+    /// runtimes never receive privileged repair merely because their wire spec is function-shaped.
+    fn argument_repair_policy(&self) -> Option<ArgumentRepairPolicy> {
+        None
+    }
+
     /// Classifies whether this trusted runtime may emit model data to telemetry.
     ///
     /// External runtimes keep the standard policy even when they happen to use
@@ -204,6 +213,7 @@ pub(crate) struct AnyToolResult {
     pub(crate) payload: ToolPayload,
     pub(crate) result: Box<dyn ToolOutput>,
     pub(crate) post_tool_use_payload: Option<PostToolUsePayload>,
+    pub(crate) argument_repair_receipt: Option<codex_history::ToolArgumentRepairReceipt>,
 }
 
 impl AnyToolResult {
@@ -212,11 +222,13 @@ impl AnyToolResult {
             call_id,
             payload,
             result,
+            argument_repair_receipt,
             ..
         } = self;
         ModelToolCallResponse {
             item: result.to_response_item(&call_id, &payload),
             provenance: result.provenance(),
+            argument_repair_receipt,
         }
     }
 
@@ -596,6 +608,13 @@ impl ToolRegistry {
             return Err(err);
         }
 
+        // Repair is deliberately before the combined PreToolUse authorization/rewrite hook. The
+        // hook therefore observes the same arguments that the handler and approval layer will
+        // receive; a later hook rewrite remains the trusted final input and is not silently
+        // re-repaired.
+        let mut argument_repair_receipt =
+            crate::tools::argument_repair::repair_invocation(tool.as_ref(), &mut invocation);
+
         if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
             match run_pre_tool_use_hooks(
                 &invocation.session,
@@ -626,6 +645,9 @@ impl ToolRegistry {
                 } => match tool.with_updated_hook_input(invocation.clone(), updated_input) {
                     Ok(updated_invocation) => {
                         invocation = updated_invocation;
+                        // A trusted hook rewrite supersedes the repaired value. Do not claim that
+                        // the earlier rules describe the effective handler arguments.
+                        argument_repair_receipt = None;
                     }
                     Err(err) => {
                         if tool.is_builtin_control_tool() {
@@ -673,7 +695,7 @@ impl ToolRegistry {
 
         let log_payload = tool_log_payload(&invocation.payload, &invocation.source, log_policy);
 
-        let result = otel
+        let mut result = otel
             .log_tool_result_with_policy(
                 &tool_name,
                 &call_id_owned,
@@ -690,6 +712,9 @@ impl ToolRegistry {
                 },
             )
             .await;
+        if let Ok(result) = &mut result {
+            result.argument_repair_receipt = argument_repair_receipt.take();
+        }
         let success = match &result {
             Ok(result) => result.result.success_for_logging(),
             Err(_) => false,
@@ -758,6 +783,21 @@ impl ToolRegistry {
                         });
                         let err = FunctionCallError::RespondToModel(message);
                         dispatch_trace.record_failed(&err);
+                        if result
+                            .argument_repair_receipt
+                            .as_ref()
+                            .is_some_and(|receipt| {
+                                receipt.outcome
+                                    == codex_history::ToolArgumentRepairOutcome::Repaired
+                            })
+                        {
+                            result.result = Box::new(FunctionToolOutput::from_text(
+                                err.to_string(),
+                                Some(/*success*/ false),
+                            ));
+                            result.post_tool_use_payload = None;
+                            return Ok(result);
+                        }
                         return Err(err);
                     }
                     if let Some(feedback_message) = outcome.feedback_message {
@@ -781,7 +821,22 @@ impl ToolRegistry {
             }
             Err(err) => {
                 dispatch_trace.record_failed(&err);
-                Err(err)
+                let repaired_receipt = argument_repair_receipt.filter(|receipt| {
+                    receipt.outcome == codex_history::ToolArgumentRepairOutcome::Repaired
+                });
+                let Some(argument_repair_receipt) = repaired_receipt else {
+                    return Err(err);
+                };
+                Ok(AnyToolResult {
+                    call_id: invocation.call_id.clone(),
+                    payload: invocation.payload.clone(),
+                    result: Box::new(FunctionToolOutput::from_text(
+                        err.to_string(),
+                        Some(/*success*/ false),
+                    )),
+                    post_tool_use_payload: None,
+                    argument_repair_receipt: Some(argument_repair_receipt),
+                })
             }
         }
     }
@@ -824,6 +879,7 @@ async fn handle_any_tool(
         payload,
         result: output,
         post_tool_use_payload,
+        argument_repair_receipt: None,
     })
 }
 

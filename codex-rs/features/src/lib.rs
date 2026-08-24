@@ -105,6 +105,8 @@ pub enum Feature {
     ContentItemKinds,
     /// Record model-attempted tool calls in internal Responses metadata.
     ExecutedToolCallMetadata,
+    /// Repair a bounded allowlist of malformed first-party function arguments before dispatch.
+    ToolArgumentRepair,
     /// Enable JavaScript code mode backed by the standalone host process.
     CodeMode,
     /// Removed compatibility flag for the configurable code-mode exec yield timeout.
@@ -938,6 +940,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ToolArgumentRepair,
+        key: "tool_argument_repair",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::CodeMode,
         key: "code_mode",
         stage: Stage::UnderDevelopment,
@@ -1532,8 +1540,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::NativeReadFile,
         key: "native_read_file",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::FastMode,

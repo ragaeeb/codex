@@ -69,6 +69,7 @@ pub struct ToolInvocation {
 pub(crate) struct ModelToolCallResponse {
     pub(crate) item: ResponseInputItem,
     pub(crate) provenance: ToolOutputProvenance,
+    pub(crate) argument_repair_receipt: Option<codex_history::ToolArgumentRepairReceipt>,
 }
 
 #[derive(Clone, Debug)]

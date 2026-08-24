@@ -513,6 +513,12 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawResponseItemEmission {
+    Emit,
+    Suppress,
+}
+
 impl Session {
     /// Spawn and initialize a new session.
     pub(crate) async fn spawn(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
@@ -3259,15 +3265,37 @@ impl Session {
         turn_context: &TurnContext,
         response: ModelToolCallResponse,
     ) -> ResponseItem {
-        let ModelToolCallResponse { item, provenance } = response;
+        let ModelToolCallResponse {
+            item,
+            provenance,
+            argument_repair_receipt,
+        } = response;
         let item = ResponseItem::from(item);
-        self.record_conversation_items_with_provenance(
+        self.record_conversation_items_with_provenance_and_receipt(
             turn_context,
             std::slice::from_ref(&item),
             provenance,
+            argument_repair_receipt.as_ref(),
+            RawResponseItemEmission::Emit,
         )
         .await;
         item
+    }
+
+    pub(crate) async fn record_model_context_item_with_repair_receipt(
+        &self,
+        turn_context: &TurnContext,
+        item: ResponseItem,
+        receipt: Option<&codex_history::ToolArgumentRepairReceipt>,
+    ) {
+        self.record_conversation_items_with_provenance_and_receipt(
+            turn_context,
+            std::slice::from_ref(&item),
+            ToolOutputProvenance::Untrusted,
+            receipt,
+            RawResponseItemEmission::Suppress,
+        )
+        .await;
     }
 
     async fn record_conversation_items_with_provenance(
@@ -3275,6 +3303,24 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
         provenance: ToolOutputProvenance,
+    ) {
+        self.record_conversation_items_with_provenance_and_receipt(
+            turn_context,
+            items,
+            provenance,
+            /*argument_repair_receipt*/ None,
+            RawResponseItemEmission::Emit,
+        )
+        .await;
+    }
+
+    async fn record_conversation_items_with_provenance_and_receipt(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        provenance: ToolOutputProvenance,
+        argument_repair_receipt: Option<&codex_history::ToolArgumentRepairReceipt>,
+        raw_response_item_emission: RawResponseItemEmission,
     ) {
         let (items, image_preparations) =
             self.prepare_conversation_items_for_history(turn_context, items);
@@ -3287,7 +3333,7 @@ impl Session {
         .with_spilling_supported(self.output_artifact_spilling_supported());
         let mut projected_items = Vec::with_capacity(raw_items.len());
         for item in raw_items {
-            let (projected, measurement) = if provenance == ToolOutputProvenance::Untrusted {
+            let (mut projected, measurement) = if provenance == ToolOutputProvenance::Untrusted {
                 projector.project_response_item(item).await
             } else {
                 projector
@@ -3297,6 +3343,12 @@ impl Session {
             if let Some(measurement) = &measurement {
                 record_tool_output_projection(turn_context, measurement);
             }
+            if let Some(receipt) = argument_repair_receipt {
+                projected
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .set_tool_argument_repair(receipt.clone());
+            }
             projected_items.push(projected);
         }
         self.record_prepared_conversation_items(
@@ -3304,6 +3356,7 @@ impl Session {
             projected_items,
             raw_items.to_vec(),
             image_preparations,
+            raw_response_item_emission,
         )
         .await;
     }
@@ -3314,6 +3367,7 @@ impl Session {
         items: Vec<ResponseItemEnvelope>,
         response_items: Vec<ResponseItem>,
         image_preparations: Vec<ImagePreparationMetadata>,
+        raw_response_item_emission: RawResponseItemEmission,
     ) {
         {
             let mut state = self.state.lock().await;
@@ -3342,8 +3396,10 @@ impl Session {
         {
             mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
         }
-        self.send_raw_response_items(turn_context, &response_items)
-            .await;
+        if raw_response_item_emission == RawResponseItemEmission::Emit {
+            self.send_raw_response_items(turn_context, &response_items)
+                .await;
+        }
     }
 
     pub(crate) async fn record_step_world_state_if_changed(

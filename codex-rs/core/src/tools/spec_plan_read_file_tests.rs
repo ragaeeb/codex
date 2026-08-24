@@ -31,7 +31,10 @@ async fn dynamic_tools_cannot_replace_native_read_file() {
 
 #[tokio::test]
 async fn native_read_file_feature_controls_environment_backed_exposure() {
-    let disabled = probe(|_| {}).await;
+    let disabled = probe(|turn| {
+        set_feature(turn, Feature::NativeReadFile, /*enabled*/ false);
+    })
+    .await;
     disabled.assert_visible_lacks(&["read_file"]);
     disabled.assert_registered_lacks(&["read_file"]);
 

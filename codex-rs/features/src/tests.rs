@@ -37,6 +37,20 @@ fn under_development_features_are_disabled_by_default() {
 }
 
 #[test]
+fn local_optimization_features_are_enabled_by_default() {
+    assert!(Features::with_defaults().enabled(Feature::NativeReadFile));
+    assert_eq!(Feature::ToolArgumentRepair.key(), "tool_argument_repair");
+    assert!(Features::with_defaults().enabled(Feature::ToolArgumentRepair));
+
+    let features: FeaturesToml = toml::from_str("tool_argument_repair = true")
+        .expect("tool argument repair should deserialize");
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("tool_argument_repair".to_string(), true)])
+    );
+}
+
+#[test]
 fn tool_registry_config_is_not_a_feature_toggle() {
     let features: FeaturesToml = toml::from_str(
         "[tool_registry]\nerror_on_tool_collisions = true\nturn_metadata_includes_tool_info = true\n",

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -46,6 +47,8 @@ pub(crate) struct ToolCallRuntime {
     step_context: Arc<StepContext>,
     tracker: SharedTurnDiffTracker,
     parallel_execution: Arc<RwLock<()>>,
+    argument_repair_disclosure:
+        Arc<Mutex<crate::tools::argument_repair::ArgumentRepairDisclosureAccumulator>>,
 }
 
 impl ToolCallRuntime {
@@ -54,12 +57,44 @@ impl ToolCallRuntime {
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
     ) -> Self {
+        Self::new_with_argument_repair_disclosure(
+            session,
+            step_context,
+            tracker,
+            Arc::new(Mutex::new(Default::default())),
+        )
+    }
+
+    pub(crate) fn new_with_argument_repair_disclosure(
+        session: Arc<Session>,
+        step_context: Arc<StepContext>,
+        tracker: SharedTurnDiffTracker,
+        argument_repair_disclosure: Arc<
+            Mutex<crate::tools::argument_repair::ArgumentRepairDisclosureAccumulator>,
+        >,
+    ) -> Self {
         Self {
             session,
             step_context,
             tracker,
             parallel_execution: Arc::new(RwLock::new(())),
+            argument_repair_disclosure,
         }
+    }
+
+    pub(crate) fn argument_repair_disclosure(
+        &self,
+    ) -> Arc<Mutex<crate::tools::argument_repair::ArgumentRepairDisclosureAccumulator>> {
+        Arc::clone(&self.argument_repair_disclosure)
+    }
+
+    pub(crate) fn take_argument_repair_disclosure(
+        &self,
+    ) -> Option<crate::tools::argument_repair::ArgumentRepairDisclosure> {
+        self.argument_repair_disclosure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_disclosure()
     }
 
     pub(crate) fn create_diff_consumer(
@@ -91,6 +126,7 @@ impl ToolCallRuntime {
                 Err(other) => Ok(ModelToolCallResponse {
                     item: Self::failure_response(error_call, other),
                     provenance: codex_tools::ToolOutputProvenance::Untrusted,
+                    argument_repair_receipt: None,
                 }),
             }
         }
@@ -137,6 +173,8 @@ impl ToolCallRuntime {
             .map(|timing| Arc::clone(&timing.execution_started_at));
         let abort_session = Arc::clone(&session);
         let abort_source = source.clone();
+        let disclosure_source = source.clone();
+        let argument_repair_disclosure = Arc::clone(&self.argument_repair_disclosure);
         let abort_turn = Arc::clone(&turn);
         let terminal_outcome_reached = Arc::new(AtomicBool::new(false));
         let dispatch_terminal_outcome_reached = Arc::clone(&terminal_outcome_reached);
@@ -186,7 +224,7 @@ impl ToolCallRuntime {
 
         async move {
             let _tool_call_timing_guard = tool_call_timing_guard;
-            tokio::select! {
+            let result = tokio::select! {
                 res = &mut dispatch_handle => res.map_err(Self::tool_task_join_error)?,
                 _ = cancellation_token.cancelled() => {
                     if terminal_outcome_reached.load(Ordering::Acquire) || dispatch_handle.is_finished() {
@@ -225,7 +263,14 @@ impl ToolCallRuntime {
                         Ok(response)
                     }
                 },
+            };
+            if let Ok(result) = &result {
+                argument_repair_disclosure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(result.argument_repair_receipt.as_ref(), &disclosure_source);
             }
+            result
         }
         .in_current_span()
     }
@@ -271,6 +316,7 @@ impl ToolCallRuntime {
                 message: Self::abort_message(call, secs),
             }),
             post_tool_use_payload: None,
+            argument_repair_receipt: None,
         }
     }
 

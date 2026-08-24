@@ -1373,6 +1373,7 @@ async fn run_sampling_request(
         &sess,
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
+        tool_runtime.argument_repair_disclosure(),
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retry_state = ResponsesStreamRetryState::default();
@@ -2765,6 +2766,14 @@ async fn try_run_sampling_request(
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    if let Some(disclosure) = tool_runtime.take_argument_repair_disclosure() {
+        sess.record_model_context_item_with_repair_receipt(
+            &turn_context,
+            disclosure.item,
+            disclosure.nested_receipt.as_ref(),
+        )
+        .await;
+    }
     drop(tool_blocking_timing_guard);
 
     if should_emit_token_count {

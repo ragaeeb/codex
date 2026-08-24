@@ -117,6 +117,7 @@ impl Session {
             annotated_items,
             response_items,
             image_preparations,
+            super::RawResponseItemEmission::Emit,
         )
         .await;
     }

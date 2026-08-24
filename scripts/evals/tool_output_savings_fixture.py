@@ -42,8 +42,13 @@ class Fixture:
     python_executable: str
 
 
-def build_fixture(root: Path, *, python_executable: str | None = None) -> Fixture:
-    suffix = secrets.token_hex(8)
+def build_fixture(
+    root: Path,
+    *,
+    python_executable: str | None = None,
+    suffix: str | None = None,
+) -> Fixture:
+    suffix = suffix or secrets.token_hex(8)
     shell_head = f"SAVINGS_SHELL_HEAD_{suffix}"
     shell_middle = f"SAVINGS_SHELL_MIDDLE_{suffix}"
     shell_tail = f"SAVINGS_SHELL_TAIL_{suffix}"
@@ -419,6 +424,8 @@ def build_cli_command(
     reasoning_effort: str,
     model_tool_mode_value: str,
     sqlite_home: Path | None = None,
+    tool_argument_repair: bool | None = None,
+    stage3: bool = False,
 ) -> list[str]:
     command = [
         str(cli),
@@ -431,12 +438,24 @@ def build_cli_command(
     ]
     if model_tool_mode_value == "code_mode_only":
         command.extend(["--enable", "code_mode_host"])
-        from tool_output_savings_code_mode_lane import code_mode_prompt
+        if stage3:
+            from tool_output_savings_stage3 import stage3_code_mode_prompt
 
-        selected_prompt = code_mode_prompt(fixture)
+            selected_prompt = stage3_code_mode_prompt(fixture)
+        else:
+            from tool_output_savings_code_mode_lane import code_mode_prompt
+
+            selected_prompt = code_mode_prompt(fixture)
     else:
         command.extend(["--disable", "code_mode", "--disable", "code_mode_host"])
         selected_prompt = prompt(fixture)
+    if tool_argument_repair is not None:
+        command.extend(
+            [
+                "--enable" if tool_argument_repair else "--disable",
+                "tool_argument_repair",
+            ]
+        )
     command.extend(
         [
             "-m",
