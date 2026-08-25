@@ -1538,12 +1538,13 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     let inherited_output = "fork-inherited tool output\n".repeat(100);
     let inherited_artifact_id =
         codex_utils_output_truncation::OutputArtifactId::for_text(&inherited_output);
-    let source_turn = source
+    let (source_turn, _) = source
         .thread
         .session
         .new_turn_with_sub_id(
             "artifact-turn".to_string(),
             SessionSettingsUpdate::default(),
+            crate::session::turn_context::NewTurnContextOptions::default(),
         )
         .await
         .expect("build source turn context");

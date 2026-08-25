@@ -414,12 +414,11 @@ async fn recoverable_shell_capture_falls_back_at_its_hard_quota() {
 
 #[tokio::test]
 async fn recoverable_shell_capture_never_publishes_an_unusable_small_policy_handle() {
-    for budget in [128_i64, 199, 200] {
+    for (token_limit, budget) in [(32, 128_i64), (49, 196), (50, 200)] {
         let (session, mut turn) = make_session_and_context().await;
-        let mut model_info = (*turn.model_info).clone();
-        model_info.truncation_policy =
-            codex_protocol::openai_models::TruncationPolicyConfig::bytes(budget);
-        turn.model_info = Arc::new(model_info);
+        Arc::get_mut(&mut turn.config)
+            .expect("test turn config should be uniquely owned")
+            .tool_output_token_limit = Some(token_limit);
         let session = Arc::new(session);
         let turn = Arc::new(turn);
         let mut buffer = HeadTailBuffer::new_recoverable(4 * 1024);

@@ -1517,6 +1517,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: config.features.enabled(Feature::SkillCatalogSelection),
         },
     );
     let mut builder = test_codex()
@@ -1743,6 +1744,7 @@ async fn executor_only_provider_preserves_structured_repo_skill_without_discover
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: config.features.enabled(Feature::SkillCatalogSelection),
         },
     );
     let mut builder = test_codex()
