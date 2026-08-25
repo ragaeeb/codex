@@ -31,6 +31,7 @@ pub const TURN_NETWORK_PROXY_METRIC: &str = "codex.turn.network_proxy";
 pub const TURN_MEMORY_METRIC: &str = "codex.turn.memory";
 pub const TURN_TOOL_CALL_METRIC: &str = "codex.turn.tool.call";
 pub const TURN_TOKEN_USAGE_METRIC: &str = "codex.turn.token_usage";
+pub const TURN_COST_MICROUSD_METRIC: &str = "codex.turn.cost_microusd";
 pub const TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC: &str =
     "codex.turn.unified_exec.running_processes";
 pub const GUARDIAN_REVIEW_COUNT_METRIC: &str = "codex.guardian.review";
@@ -64,3 +65,12 @@ pub const THREAD_SKILLS_KEPT_TOTAL_METRIC: &str = "codex.thread.skills.kept_tota
 pub const THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC: &str =
     "codex.thread.skills.description_truncated_chars";
 pub const THREAD_SKILLS_TRUNCATED_METRIC: &str = "codex.thread.skills.truncated";
+pub const THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC: &str = "codex.thread.skills.catalog_full_bytes";
+pub const THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC: &str =
+    "codex.thread.skills.catalog_rendered_bytes";
+pub const THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC: &str =
+    "codex.thread.skills.catalog_full_tokens";
+pub const THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC: &str =
+    "codex.thread.skills.catalog_rendered_tokens";
+pub const THREAD_SKILLS_CATALOG_RENDER_OUTCOME_METRIC: &str =
+    "codex.thread.skills.catalog_render_outcome";

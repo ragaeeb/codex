@@ -1,11 +1,17 @@
 use codex_extension_api::ExtensionMetrics;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDER_OUTCOME_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC;
 use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC;
 use codex_otel::THREAD_SKILLS_ENABLED_TOTAL_METRIC;
 use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
 use codex_otel::THREAD_SKILLS_TRUNCATED_METRIC;
 
-use crate::render::SkillMetadataBudget;
-use crate::render::SkillRenderReport;
+use crate::render_policy::SkillMetadataBudget;
+use crate::render_policy::SkillRenderReport;
+use crate::render_policy::SkillRenderSize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogSurface {
@@ -33,6 +39,7 @@ pub(crate) fn record_catalog_render(
     catalog_surface: CatalogSurface,
     budget: SkillMetadataBudget,
     report: &SkillRenderReport,
+    size: SkillRenderSize,
 ) {
     record_catalog_metrics(
         extension_metrics,
@@ -42,8 +49,50 @@ pub(crate) fn record_catalog_render(
         report.omitted_count,
         report.truncated_description_chars,
     );
+    record_catalog_size_metrics(extension_metrics, catalog_surface, size);
 
     trace_catalog_budget_pressure(budget, report);
+}
+
+fn record_catalog_size_metrics(
+    extension_metrics: Option<&dyn ExtensionMetrics>,
+    catalog_surface: CatalogSurface,
+    size: SkillRenderSize,
+) {
+    let Some(extension_metrics) = extension_metrics else {
+        return;
+    };
+    let tags = [("catalog_surface", catalog_surface.as_str())];
+    for (name, value) in [
+        (
+            THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC,
+            size.full_body_bytes,
+        ),
+        (
+            THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC,
+            size.rendered_body_bytes,
+        ),
+        (
+            THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC,
+            size.full_body_tokens,
+        ),
+        (
+            THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC,
+            size.rendered_body_tokens,
+        ),
+    ] {
+        extension_metrics.histogram(name, i64::try_from(value).unwrap_or(i64::MAX), &tags);
+    }
+    if let Some(outcome) = size.outcome {
+        extension_metrics.histogram(
+            THREAD_SKILLS_CATALOG_RENDER_OUTCOME_METRIC,
+            /*value*/ 1,
+            &[
+                ("catalog_surface", catalog_surface.as_str()),
+                ("render_outcome", outcome.as_str()),
+            ],
+        );
+    }
 }
 
 pub(crate) fn trace_catalog_budget_pressure(

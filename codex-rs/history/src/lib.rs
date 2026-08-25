@@ -9,6 +9,7 @@ use std::sync::Arc;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -22,12 +23,16 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::WorldStateItem;
+use codex_protocol::realtime::RealtimeItem;
+use codex_protocol::security_risk::SecurityRiskScore;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
 use serde::de::Error as _;
+use serde::de::SeqAccess;
+use serde::de::Visitor;
 
 /// A model-history item with room for history-only metadata.
 ///
@@ -38,13 +43,283 @@ pub struct ResponseItemEnvelope {
     pub metadata: Option<CodexHarnessMetadata>,
 }
 
-/// Metadata owned by the Codex harness and persisted with a response item.
+/// Maximum serialized text carried by a store-backed tool-output control item.
 ///
+/// This is intentionally independent of a model's normal tool-output policy:
+/// the fixed metadata needed to recover an artifact can be larger than a very
+/// small configured output limit, but must still have a hard context ceiling.
+pub const STORE_BACKED_TOOL_OUTPUT_MAX_BYTES: usize = 32 * 1024;
+/// Maximum history-only artifact references retained on one metadata carrier.
+pub const MAX_STORE_BACKED_ARTIFACT_REFERENCES: usize = 256;
+/// Maximum stable rule occurrences retained in one argument-repair receipt.
+pub const MAX_TOOL_ARGUMENT_REPAIR_RULES: usize = 8;
+/// Maximum byte value retained for one argument-repair measurement.
+pub const MAX_TOOL_ARGUMENT_REPAIR_BYTES: usize = 64 * 1024;
+/// Maximum candidate-work count retained in one argument-repair receipt.
+pub const MAX_TOOL_ARGUMENT_REPAIR_CANDIDATE_WORK: usize = 4096;
+/// Maximum repair duration retained in one argument-repair receipt.
+pub const MAX_TOOL_ARGUMENT_REPAIR_DURATION_MICROS: u64 = 60 * 1_000_000;
+
+/// Trusted tool families used by the bounded argument-repair cohort.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolArgumentRepairToolFamily {
+    ReadFile,
+    Unlisted,
+}
+
+/// Stable result categories for one argument-repair attempt.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolArgumentRepairOutcome {
+    PolicyMiss,
+    ValidUnchanged,
+    Repaired,
+    NotRepairable,
+    LimitExceeded,
+    UnsupportedSchema,
+}
+
+/// Stable reasons that can accompany a non-repaired attempt.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolArgumentRepairReason {
+    NotAllowlisted,
+    UnsupportedSchema,
+    LimitExceeded,
+    ValidationFailure,
+}
+
+/// Bounded history-only receipt for the effective arguments used by a tool handler.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct ToolArgumentRepairReceipt {
+    pub tool_family: ToolArgumentRepairToolFamily,
+    pub outcome: ToolArgumentRepairOutcome,
+    #[serde(default, deserialize_with = "deserialize_bounded_rule_ids")]
+    pub rules: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_bounded_bytes")]
+    pub input_bytes: usize,
+    #[serde(default, deserialize_with = "deserialize_bounded_bytes")]
+    pub effective_bytes: usize,
+    #[serde(default, deserialize_with = "deserialize_bounded_candidate_work")]
+    pub candidate_work: usize,
+    #[serde(default, deserialize_with = "deserialize_bounded_duration")]
+    pub repair_duration_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ToolArgumentRepairReason>,
+}
+
+fn deserialize_bounded_rule_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedRuleIdsVisitor;
+
+    impl<'de> Visitor<'de> for BoundedRuleIdsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_TOOL_ARGUMENT_REPAIR_RULES} bounded argument-repair rule IDs"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut rules = Vec::with_capacity(MAX_TOOL_ARGUMENT_REPAIR_RULES);
+            while let Some(rule) = sequence.next_element::<String>()? {
+                if rules.len() >= MAX_TOOL_ARGUMENT_REPAIR_RULES {
+                    return Err(A::Error::invalid_length(rules.len() + 1, &self));
+                }
+                if rule.len() <= 64
+                    && !rule.is_empty()
+                    && rule.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+                    && is_stable_tool_argument_repair_rule(&rule)
+                {
+                    rules.push(rule);
+                }
+            }
+            Ok(rules)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedRuleIdsVisitor)
+}
+
+fn deserialize_bounded_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(usize::deserialize(deserializer)?.min(MAX_TOOL_ARGUMENT_REPAIR_BYTES))
+}
+
+fn deserialize_bounded_candidate_work<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(usize::deserialize(deserializer)?.min(MAX_TOOL_ARGUMENT_REPAIR_CANDIDATE_WORK))
+}
+
+fn deserialize_bounded_duration<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(u64::deserialize(deserializer)?.min(MAX_TOOL_ARGUMENT_REPAIR_DURATION_MICROS))
+}
+
+fn is_stable_tool_argument_repair_rule(rule: &str) -> bool {
+    matches!(
+        rule,
+        "optional_null_removed"
+            | "stringified_array_decoded"
+            | "stringified_object_decoded"
+            | "scalar_wrapped_in_array"
+            | "numeric_string_typed"
+            | "boolean_string_typed"
+            | "known_field_alias"
+            | "markdown_path_unwrapped"
+    )
+}
+
+/// Metadata owned by the Codex harness and persisted with a response item.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct CodexHarnessMetadata {
     /// Whether a developer message was supplied by an app-server client.
     #[serde(default)]
     pub client_authored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_output_provenance: Option<ToolOutputProvenance>,
+    /// Bounded, history-only references retained across compaction. These are never projected to
+    /// the model; they let fork/resume copy a managed artifact even when its model-facing control
+    /// was omitted by the compaction budget.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_artifact_references",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    store_backed_artifact_references: Vec<StoreBackedArtifactReference>,
+    /// Bounded effective-call metadata for tool argument repair. The raw response item remains
+    /// unchanged; this receipt is the history-only record of what the handler observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_argument_repair: Option<ToolArgumentRepairReceipt>,
+}
+
+/// A validated-at-use, history-only reference to an existing managed output artifact.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct StoreBackedArtifactReference {
+    pub artifact_id: String,
+}
+
+fn deserialize_bounded_artifact_references<'de, D>(
+    deserializer: D,
+) -> Result<Vec<StoreBackedArtifactReference>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        Vec::<StoreBackedArtifactReference>::deserialize(deserializer)?
+            .into_iter()
+            .take(MAX_STORE_BACKED_ARTIFACT_REFERENCES)
+            .collect(),
+    )
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ToolOutputProvenance {
+    StoreBackedArtifactV1,
+}
+
+impl CodexHarnessMetadata {
+    /// Marks a developer message supplied by an app-server client.
+    pub fn client_authored() -> Self {
+        Self {
+            client_authored: true,
+            ..Default::default()
+        }
+    }
+
+    /// Marks a bounded tool-output control document whose artifact was verified
+    /// in the managed store by the harness.
+    pub fn store_backed_tool_output() -> Self {
+        Self {
+            client_authored: false,
+            tool_output_provenance: Some(ToolOutputProvenance::StoreBackedArtifactV1),
+            store_backed_artifact_references: Vec::new(),
+            tool_argument_repair: None,
+        }
+    }
+
+    /// Adds a bounded effective-call receipt while preserving other harness metadata.
+    pub fn with_tool_argument_repair(mut self, receipt: ToolArgumentRepairReceipt) -> Self {
+        self.set_tool_argument_repair(receipt);
+        self
+    }
+
+    /// Replaces the effective-call receipt on this metadata value.
+    pub fn set_tool_argument_repair(&mut self, receipt: ToolArgumentRepairReceipt) {
+        self.tool_argument_repair = Some(ToolArgumentRepairReceipt {
+            rules: receipt
+                .rules
+                .into_iter()
+                .filter(|rule| is_stable_tool_argument_repair_rule(rule))
+                .take(MAX_TOOL_ARGUMENT_REPAIR_RULES)
+                .collect(),
+            input_bytes: receipt.input_bytes.min(MAX_TOOL_ARGUMENT_REPAIR_BYTES),
+            effective_bytes: receipt.effective_bytes.min(MAX_TOOL_ARGUMENT_REPAIR_BYTES),
+            candidate_work: receipt
+                .candidate_work
+                .min(MAX_TOOL_ARGUMENT_REPAIR_CANDIDATE_WORK),
+            repair_duration_micros: receipt
+                .repair_duration_micros
+                .min(MAX_TOOL_ARGUMENT_REPAIR_DURATION_MICROS),
+            ..receipt
+        });
+    }
+
+    /// Returns the effective-call receipt, if one was persisted.
+    pub fn tool_argument_repair(&self) -> Option<&ToolArgumentRepairReceipt> {
+        self.tool_argument_repair.as_ref()
+    }
+
+    /// Returns whether this response item is a verified store-backed control document.
+    pub fn is_store_backed_tool_output(&self) -> bool {
+        matches!(
+            self.tool_output_provenance,
+            Some(ToolOutputProvenance::StoreBackedArtifactV1)
+        )
+    }
+
+    /// Adds bounded history-only artifact references while preserving unrelated metadata.
+    pub fn with_store_backed_artifact_references(
+        mut self,
+        artifact_ids: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.set_store_backed_artifact_references(artifact_ids);
+        self
+    }
+
+    /// Replaces the bounded history-only artifact references on this metadata value.
+    pub fn set_store_backed_artifact_references(
+        &mut self,
+        artifact_ids: impl IntoIterator<Item = String>,
+    ) {
+        self.store_backed_artifact_references = artifact_ids
+            .into_iter()
+            .take(MAX_STORE_BACKED_ARTIFACT_REFERENCES)
+            .map(|artifact_id| StoreBackedArtifactReference { artifact_id })
+            .collect();
+    }
+
+    /// Returns history-only artifact references; callers must validate the IDs before use.
+    pub fn store_backed_artifact_references(&self) -> &[StoreBackedArtifactReference] {
+        &self.store_backed_artifact_references
+    }
 }
 
 impl ResponseItemEnvelope {
@@ -94,11 +369,16 @@ pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
     ResponseItem(ResponseItemEnvelope),
     InterAgentCommunication(InterAgentCommunication),
-    InterAgentCommunicationMetadata { trigger_turn: bool },
+    InterAgentCommunicationMetadata {
+        trigger_turn: bool,
+    },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
+    SecurityRiskScore(SecurityRiskScore),
     EventMsg(EventMsg),
+    /// Sparse, model-invisible facts used to reconstruct realtime presentation.
+    RealtimeItem(RealtimeItem),
 }
 
 impl Serialize for RolloutItem {
@@ -139,6 +419,7 @@ mod rollout_payload;
 pub struct CompactedItem {
     pub message: String,
     pub replacement_history: Option<Vec<ResponseItemEnvelope>>,
+    pub mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     pub window_number: Option<u64>,
     pub first_window_id: Option<String>,
     pub previous_window_id: Option<String>,
@@ -410,6 +691,8 @@ fn multi_agent_version_from_items(
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::RealtimeItem(_)
             | RolloutItem::EventMsg(_) => None,
         })
     })

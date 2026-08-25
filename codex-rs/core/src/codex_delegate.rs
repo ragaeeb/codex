@@ -34,6 +34,10 @@ use codex_login::AuthManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::turn_input::TurnInputMode;
+use codex_protocol::turn_input::TurnInputRequest;
+use codex_protocol::turn_input::TurnInputSubmission;
+use codex_protocol::turn_input::TurnStartOptions;
 
 #[cfg(test)]
 use crate::session::completed_session_loop_termination;
@@ -62,6 +66,10 @@ pub(crate) async fn run_codex_thread_interactive(
         ));
     }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    config.model_provider.supports_websockets &= parent_session
+        .services
+        .model_client
+        .responses_websocket_enabled();
 
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
@@ -70,6 +78,13 @@ pub(crate) async fn run_codex_thread_interactive(
     let user_instructions = LoadedUserInstructions {
         instructions: parent_session.user_instructions().await,
         warnings: Vec::new(),
+    };
+    let session_source = SessionSource::SubAgent(subagent_source.clone());
+    let is_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source);
+    let extensions = if is_guardian_reviewer {
+        codex_extension_api::empty_extension_registry()
+    } else {
+        Arc::clone(&parent_session.services.extensions)
     };
     let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
         config,
@@ -86,14 +101,18 @@ pub(crate) async fn run_codex_thread_interactive(
         plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
         code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
-        extensions: Arc::clone(&parent_session.services.extensions),
+        extensions,
         conversation_history,
         requested_history_mode: None,
         fork_persistence: ForkPersistence::Copied,
-        session_source: SessionSource::SubAgent(subagent_source.clone()),
+        session_source,
         forked_from_thread_id,
         parent_thread_id: Some(parent_session.thread_id),
-        thread_source: Some(ThreadSource::Subagent),
+        thread_source: Some(if is_guardian_reviewer {
+            ThreadSource::GuardianReview
+        } else {
+            ThreadSource::Subagent
+        }),
         originator: parent_ctx.originator.clone(),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
@@ -106,6 +125,7 @@ pub(crate) async fn run_codex_thread_interactive(
         environment_selections: parent_environments.to_selections(),
         thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
         client_mcp_extensions: parent_session.services.client_mcp_extensions.clone(),
+        reserved_thread_id: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
         thread_store: Arc::clone(&parent_session.services.thread_store),
         attestation_provider: parent_session.services.attestation_provider.clone(),
@@ -190,19 +210,26 @@ pub(crate) async fn run_codex_thread_one_shot(
     .await?;
 
     // Send the initial input to kick off the one-shot turn.
-    io.submit_with_trace(
-        Op::UserInput {
-            items: input,
-            final_output_json_schema,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        },
-        /*trace*/ None,
-        Some(parent_turn_id),
-        root_turn_id,
-    )
-    .await?;
+    let submission = io
+        .submit_turn_input(
+            TurnInputRequest::user_input(input).on_start(TurnStartOptions {
+                final_output_json_schema,
+                service_tier: None,
+                parent_turn_id: Some(parent_turn_id),
+                root_turn_id,
+                ..Default::default()
+            }),
+            TurnInputMode::StartIfIdle,
+        )
+        .await?;
+    match submission {
+        TurnInputSubmission::Started { .. } => {}
+        submission => {
+            return Err(CodexErr::InvalidRequest(format!(
+                "delegate turn input was not started: {submission:?}"
+            )));
+        }
+    }
 
     // Bridge events so we can observe completion and shut down automatically.
     let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
@@ -222,7 +249,6 @@ pub(crate) async fn run_codex_thread_one_shot(
                     .send(Submission {
                         id: "shutdown".to_string(),
                         op: Op::Shutdown {},
-                        client_user_message_id: None,
                         trace: None,
                         parent_turn_id: None,
                         root_turn_id: None,

@@ -6,8 +6,8 @@ use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
+use codex_git_utils::SanitizedGitUrl;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
@@ -16,6 +16,7 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::client::X_CODEX_INSTALLATION_ID_HEADER;
 use crate::client::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -26,8 +27,10 @@ use crate::client::X_OPENAI_SUBAGENT_HEADER;
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";
 pub(crate) const SESSION_ID_KEY: &str = "session_id";
 pub(crate) const THREAD_ID_KEY: &str = "thread_id";
+pub(crate) const AGENT_NAME_KEY: &str = "agent_name";
 pub(crate) const TURN_ID_KEY: &str = "turn_id";
 pub(crate) const WINDOW_ID_KEY: &str = "window_id";
+pub(crate) const CONTEXT_WINDOW_ID_KEY: &str = "context_window_id";
 pub(crate) const REQUEST_KIND_KEY: &str = "request_kind";
 pub(crate) const COMPACTION_KEY: &str = "compaction";
 // Keep the removed inventory reserved so callers cannot reintroduce oversized metadata.
@@ -41,6 +44,7 @@ pub(crate) const PARENT_TURN_ID_KEY: &str = "parent_turn_id";
 pub(crate) const ROOT_TURN_ID_KEY: &str = "root_turn_id";
 pub(crate) const SUBAGENT_KIND_KEY: &str = "subagent_kind";
 pub(crate) const THREAD_SOURCE_KEY: &str = "thread_source";
+pub(crate) const TURN_TRIGGER_KEY: &str = "turn_trigger";
 pub(crate) const SANDBOX_KEY: &str = "sandbox";
 pub(crate) const SANDBOX_MODE_KEY: &str = "sandbox_mode";
 pub(crate) const AUTO_REVIEW_ENABLED_KEY: &str = "auto_review_enabled";
@@ -55,8 +59,10 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
     X_CODEX_INSTALLATION_ID_HEADER,
     SESSION_ID_KEY,
     THREAD_ID_KEY,
+    AGENT_NAME_KEY,
     TURN_ID_KEY,
     WINDOW_ID_KEY,
+    CONTEXT_WINDOW_ID_KEY,
     X_CODEX_WINDOW_ID_HEADER,
     X_CODEX_TURN_METADATA_HEADER,
     X_CODEX_PARENT_THREAD_ID_HEADER,
@@ -72,6 +78,7 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
     ROOT_TURN_ID_KEY,
     SUBAGENT_KIND_KEY,
     THREAD_SOURCE_KEY,
+    TURN_TRIGGER_KEY,
     SANDBOX_KEY,
     SANDBOX_MODE_KEY,
     AUTO_REVIEW_ENABLED_KEY,
@@ -157,7 +164,7 @@ impl CodexResponsesRequestKind {
 #[derive(Clone, Debug, Serialize, Default)]
 pub(crate) struct TurnMetadataWorkspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) associated_remote_urls: Option<BTreeMap<String, String>>,
+    pub(crate) associated_remote_urls: Option<BTreeMap<String, SanitizedGitUrl>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) latest_git_commit_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,9 +210,11 @@ pub struct CodexResponsesMetadata {
     pub(crate) installation_id: String,
     pub(crate) session_id: String,
     pub(crate) thread_id: String,
+    pub(crate) agent_name: Option<String>,
     pub(crate) turn_id: Option<String>,
     pub(crate) routing_hint: Option<HeaderValue>,
     pub(crate) window_id: String,
+    pub(crate) context_window_id: Option<Uuid>,
     pub(crate) request_kind: Option<CodexResponsesRequestKind>,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -214,6 +223,7 @@ pub struct CodexResponsesMetadata {
     pub(crate) subagent_header: Option<String>,
     pub(crate) subagent_kind: Option<String>,
     pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) turn_trigger: Option<String>,
     pub(crate) sandbox: Option<String>,
     pub(crate) sandbox_mode: Option<String>,
     pub(crate) auto_review_enabled: Option<bool>,
@@ -236,9 +246,11 @@ impl CodexResponsesMetadata {
             installation_id,
             session_id,
             thread_id,
+            agent_name: None,
             turn_id: None,
             routing_hint: None,
             window_id,
+            context_window_id: None,
             request_kind: None,
             forked_from_thread_id: None,
             parent_thread_id: None,
@@ -247,6 +259,7 @@ impl CodexResponsesMetadata {
             subagent_header: None,
             subagent_kind: None,
             thread_source: None,
+            turn_trigger: None,
             sandbox: None,
             sandbox_mode: None,
             auto_review_enabled: None,
@@ -354,10 +367,16 @@ impl CodexResponsesMetadata {
             installation_id: has_request_identity.then_some(self.installation_id.as_str()),
             session_id: has_turn_identity.then_some(self.session_id.as_str()),
             thread_id: has_turn_identity.then_some(self.thread_id.as_str()),
+            agent_name: has_turn_identity
+                .then_some(self.agent_name.as_deref())
+                .flatten(),
             turn_id: has_turn_identity
                 .then_some(self.turn_id.as_deref())
                 .flatten(),
             window_id: has_request_identity.then_some(self.window_id.as_str()),
+            context_window_id: has_request_identity
+                .then_some(self.context_window_id)
+                .flatten(),
             request_kind: request_kind_value,
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
@@ -365,6 +384,7 @@ impl CodexResponsesMetadata {
             root_turn_id: self.root_turn_id.as_deref(),
             subagent_kind: self.subagent_kind.as_deref(),
             thread_source: self.thread_source.as_ref(),
+            turn_trigger: self.turn_trigger.as_deref(),
             sandbox: self.sandbox.as_deref(),
             sandbox_mode: self.sandbox_mode.as_deref(),
             auto_review_enabled: self.auto_review_enabled,
@@ -391,9 +411,7 @@ pub(crate) fn subagent_header_value(session_source: &SessionSource) -> Option<St
             SubAgentSource::ThreadSpawn { .. } => Some("collab_spawn".to_string()),
             SubAgentSource::Other(label) => Some(label.clone()),
         },
-        SessionSource::Internal(InternalSessionSource::MemoryConsolidation) => {
-            Some("memory_consolidation".to_string())
-        }
+        SessionSource::Internal(source) => Some(source.to_string()),
         SessionSource::Cli
         | SessionSource::VSCode
         | SessionSource::Exec
@@ -474,9 +492,13 @@ struct CodexTurnMetadataPayload<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_name: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     turn_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_id: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_kind: Option<&'static str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -491,6 +513,8 @@ struct CodexTurnMetadataPayload<'a> {
     subagent_kind: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_source: Option<&'a ThreadSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_trigger: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sandbox: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

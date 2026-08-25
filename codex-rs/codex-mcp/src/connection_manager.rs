@@ -11,6 +11,8 @@ mod required;
 mod resources;
 #[path = "connection_manager/startup.rs"]
 mod startup;
+#[path = "connection_manager/status.rs"]
+mod status;
 #[path = "connection_manager/tool_catalog.rs"]
 mod tool_catalog;
 
@@ -27,7 +29,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::McpServerSource;
 use crate::binding::call_tool_result_from_rmcp;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
@@ -36,6 +37,7 @@ use crate::mcp::ToolPluginProvenance;
 use crate::pagination::MAX_CODEX_APPS_TOOL_CATALOG_ITEMS;
 use crate::pagination::MAX_MCP_CATALOG_ITEMS;
 use crate::rmcp_client::AsyncManagedClient;
+use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
 use crate::rmcp_client::DEFAULT_TOOL_TIMEOUT;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
@@ -53,13 +55,12 @@ use crate::tools::filter_tools;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use codex_config::McpServerTransportConfig;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::McpServerInfo;
-use codex_protocol::models::PermissionProfile;
-use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpStartupCompleteEvent;
@@ -79,6 +80,8 @@ static LIVE_CONNECTIONS: Gauge = Gauge::new("mcp.connections.live");
 pub(crate) struct McpServerConnection {
     identity: Option<McpServerConnectionIdentity>,
     client: AsyncManagedClient,
+    // Startup-only budget; changing it must not replace a ready connection.
+    startup_timeout: Duration,
     startup_trigger: Option<watch::Sender<bool>>,
     _diagnostics_guard: GaugeGuard,
 }
@@ -178,6 +181,7 @@ impl McpServerView {
 /// A published view over a set of running MCP server connections.
 pub(crate) struct McpConnectionSet {
     servers: HashMap<String, McpServerView>,
+    disabled_servers: Vec<String>,
     protocol_mode: crate::McpProtocolMode,
     required_servers: Vec<String>,
     optional_startup_deadline: OnceLock<tokio::time::Instant>,
@@ -220,8 +224,6 @@ impl McpConnectionSet {
         } = input;
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
-        let approval_policy = &config.approval_policy;
-        let initial_permission_profile = config.permission_profile.clone();
         let codex_home = config.codex_home.clone();
         let prefix_mcp_tool_names = config.prefix_mcp_tool_names;
         let non_prefixed_mcp_tool_servers = config.non_prefixed_mcp_tool_servers.clone();
@@ -230,6 +232,11 @@ impl McpConnectionSet {
         let tool_plugin_provenance = crate::mcp::tool_plugin_provenance(&config);
         let auth = auth.as_ref();
         let mut servers = HashMap::new();
+        let disabled_servers = mcp_servers
+            .iter()
+            .filter(|(_, server)| !server.enabled())
+            .map(|(name, _)| name.clone())
+            .collect();
         let mut required_servers = mcp_servers
             .iter()
             .filter(|(_, server)| server.enabled() && server.required())
@@ -244,8 +251,7 @@ impl McpConnectionSet {
         let reusable_previous = previous.filter(|previous| {
             !previous.servers.is_empty()
                 && previous.elicitation_requests.update(
-                    approval_policy.value(),
-                    initial_permission_profile.clone(),
+                    Arc::clone(&config),
                     elicitation_reviewer.clone(),
                     elicitation_lifecycle.clone(),
                 )
@@ -254,8 +260,7 @@ impl McpConnectionSet {
             previous.elicitation_requests.clone()
         } else {
             ElicitationRequestManager::new(
-                approval_policy.value(),
-                initial_permission_profile,
+                Arc::clone(&config),
                 elicitation_reviewer,
                 elicitation_lifecycle,
                 elicitation_router,
@@ -275,16 +280,14 @@ impl McpConnectionSet {
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
-            let is_host_owned_codex_apps = server_name == CODEX_APPS_MCP_SERVER_NAME
-                && config.mcp_server_catalog.server(&server_name).is_some_and(
-                    |server| match server.source() {
-                        McpServerSource::Compatibility { .. } => true,
-                        McpServerSource::Extension { id } => id == "hosted_plugin_runtime",
-                        McpServerSource::Plugin(_)
-                        | McpServerSource::SelectedPlugin(_)
-                        | McpServerSource::Config => false,
-                    },
-                );
+            let is_host_owned_codex_apps = config
+                .mcp_server_catalog
+                .server(&server_name)
+                .is_some_and(|server| {
+                    server
+                        .source()
+                        .is_host_owned_apps(&server_name, server.config())
+                });
             let catalog_item_limit = if is_host_owned_codex_apps {
                 MAX_CODEX_APPS_TOOL_CATALOG_ITEMS
             } else {
@@ -293,6 +296,9 @@ impl McpConnectionSet {
             let metadata = McpServerMetadata::from(&server);
             let configured_config = server.config().clone();
             let configured_tool_filter = ToolFilter::from_config(&configured_config);
+            let startup_timeout = configured_config
+                .startup_timeout_sec
+                .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
             let configured_tool_timeout = Some(
                 configured_config
                     .tool_timeout_sec
@@ -376,6 +382,16 @@ impl McpConnectionSet {
                 reusable_previous.and_then(|previous| previous.servers.get(&server_name))
             {
                 let connection = Arc::clone(&previous_view.connection);
+                let reusable_pending_startup = connection.identity.as_ref()
+                    == Some(&connection_identity)
+                    && !connection.client.startup_complete.load(Ordering::Acquire)
+                    && connection.startup_timeout == startup_timeout
+                    && !connection.startup_is_dormant()
+                    && !connection.client.cancel_token.is_cancelled()
+                    && previous_view.catalog_item_limit == catalog_item_limit
+                    && expected_protocol_mode.is_some()
+                    && reusable_previous
+                        .is_some_and(|previous| previous.protocol_mode == protocol_mode);
                 let unchanged_auth_failure = if connection.identity.as_ref()
                     == Some(&connection_identity)
                     && connection_identity.oauth_store_was_contended
@@ -391,7 +407,8 @@ impl McpConnectionSet {
                 } else {
                     None
                 };
-                if unchanged_auth_failure.is_some()
+                if reusable_pending_startup
+                    || unchanged_auth_failure.is_some()
                     || connection
                         .reusable_client(&connection_identity)
                         .await
@@ -402,6 +419,8 @@ impl McpConnectionSet {
                                 })
                         })
                 {
+                    let pending_client =
+                        reusable_pending_startup.then(|| connection.client.clone());
                     servers.insert(
                         server_name.clone(),
                         McpServerView {
@@ -413,17 +432,19 @@ impl McpConnectionSet {
                         },
                     );
                     if let Some(error) = unchanged_auth_failure {
+                        let reason = connection_identity
+                            .oauth_credentials()
+                            .ok()
+                            .flatten()
+                            .map(|_| McpStartupFailureReason::ReauthenticationRequired);
                         let status = McpStartupStatus::Failed {
                             error: mcp_init_error_display(
                                 &server_name,
                                 Some(&configured_config),
                                 &error,
+                                reason,
                             ),
-                            reason: connection_identity
-                                .oauth_credentials()
-                                .ok()
-                                .flatten()
-                                .map(|_| McpStartupFailureReason::ReauthenticationRequired),
+                            reason,
                         };
                         let tx_event = tx_event.clone();
                         let submit_id = startup_submit_id.clone();
@@ -446,6 +467,14 @@ impl McpConnectionSet {
                                 }
                             }
                             (server_name, Err(error))
+                        });
+                    } else if let Some(client) = pending_client {
+                        let publication_gate = publication_gate.clone();
+                        join_set.spawn(async move {
+                            if !publication_gate.wait().await {
+                                return (server_name, Err(StartupOutcomeError::Cancelled));
+                            }
+                            (server_name, client.client().await)
                         });
                     } else {
                         reused_ready.push(server_name);
@@ -516,6 +545,7 @@ impl McpConnectionSet {
                     connection: Arc::new(McpServerConnection {
                         identity: Some(connection_identity),
                         client: async_managed_client.clone(),
+                        startup_timeout,
                         startup_trigger,
                         _diagnostics_guard: LIVE_CONNECTIONS.track(),
                     }),
@@ -564,6 +594,7 @@ impl McpConnectionSet {
                                     bearer_token_env_var,
                                     http_headers,
                                     env_http_headers,
+                                    ..
                                 } => {
                                     match determine_streamable_http_auth_status_from_credentials(
                                         configured_config
@@ -602,6 +633,7 @@ impl McpConnectionSet {
                                 server_name.as_str(),
                                 Some(&configured_config),
                                 error,
+                                reason,
                             );
                             McpStartupStatus::Failed {
                                 error: error_str,
@@ -639,6 +671,7 @@ impl McpConnectionSet {
         }
         let manager = Self {
             servers,
+            disabled_servers,
             protocol_mode,
             required_servers,
             optional_startup_deadline: OnceLock::new(),
@@ -698,6 +731,7 @@ impl McpConnectionSet {
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
             servers: HashMap::new(),
+            disabled_servers: Vec::new(),
             protocol_mode: crate::McpProtocolMode::Legacy,
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),
@@ -707,13 +741,7 @@ impl McpConnectionSet {
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
-            elicitation_requests: ElicitationRequestManager::new(
-                AskForApproval::Never,
-                PermissionProfile::default(),
-                /*reviewer*/ None,
-                /*lifecycle*/ None,
-                ElicitationRequestRouter::default(),
-            ),
+            elicitation_requests: ElicitationRequestManager::default(),
         }
     }
 
@@ -832,30 +860,60 @@ impl McpConnectionSet {
     }
 
     /// Invoke the tool indicated by the (server, tool) pair.
+    #[allow(clippy::too_many_arguments)]
     pub async fn call_tool(
         &self,
         server: &str,
         tool: &str,
+        environment_id: Option<&str>,
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
+        requested_timeout: Option<Duration>,
+        wait_for_server: bool,
     ) -> Result<CallToolResult> {
         let view = self
             .servers
             .get(server)
             .ok_or_else(|| anyhow!("unknown MCP server '{server}'"))?;
+        if let Some(environment_id) = environment_id
+            && view.metadata.environment_id != environment_id
+        {
+            bail!(
+                "MCP server `{server}` is running in environment `{}`, expected `{environment_id}`",
+                view.metadata.environment_id
+            );
+        }
         if !view.tool_filter.allows(tool) {
             return Err(anyhow!(
                 "tool '{tool}' is disabled for MCP server '{server}'"
             ));
         }
-        let client = view
-            .connection
-            .client()
-            .await
-            .context("failed to get client")?;
+        let client = if wait_for_server {
+            view.connection
+                .client()
+                .await
+                .context("failed to get client")?
+        } else {
+            let client = view
+                .connection
+                .client
+                .ready_client()
+                .ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))?;
+            if client.client.is_closed().await {
+                bail!("MCP server '{server}' is not connected");
+            }
+            client
+        };
+
+        let effective_timeout = match (view.tool_timeout, requested_timeout) {
+            (Some(server_timeout), Some(requested_timeout)) => {
+                Some(server_timeout.min(requested_timeout))
+            }
+            (server_timeout, requested_timeout) => server_timeout.or(requested_timeout),
+        };
         let result: rmcp::model::CallToolResult = client
             .client
-            .call_tool(tool.to_string(), arguments, meta, view.tool_timeout)
+            .call_tool(tool.to_string(), arguments, meta, effective_timeout)
             .await
             .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
 

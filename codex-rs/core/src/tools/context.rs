@@ -1,11 +1,7 @@
-use crate::context_manager::truncate_function_output_payload;
 use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
-use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
-use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::format_output_omission_marker;
 use crate::unified_exec::resolve_max_tokens;
@@ -21,7 +17,6 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
-use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::num::NonZeroUsize;
@@ -31,6 +26,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub use codex_tools::ToolOutput;
+use codex_tools::ToolOutputProvenance;
 pub use codex_tools::ToolPayload;
 
 pub(crate) fn boxed_tool_output<T>(output: T) -> Box<dyn ToolOutput>
@@ -70,23 +66,31 @@ pub struct ToolInvocation {
     pub payload: ToolPayload,
 }
 
+pub(crate) struct ModelToolCallResponse {
+    pub(crate) item: ResponseInputItem,
+    pub(crate) provenance: ToolOutputProvenance,
+    pub(crate) argument_repair_receipt: Option<codex_history::ToolArgumentRepairReceipt>,
+}
+
 #[derive(Clone, Debug)]
 pub struct McpToolOutput {
     pub result: CallToolResult,
     pub tool_input: JsonValue,
     pub wall_time: Duration,
     pub original_image_detail_supported: bool,
-    pub truncation_policy: TruncationPolicy,
 }
 
 impl ToolOutput for McpToolOutput {
-    fn log_preview(&self) -> String {
-        let payload = self.response_payload();
-        let preview = payload.body.to_text().unwrap_or_else(|| {
-            serde_json::to_string(&self.result.content)
-                .unwrap_or_else(|err| format!("failed to serialize mcp result: {err}"))
-        });
-        telemetry_preview(&preview)
+    fn log_output(&self) -> String {
+        // Logging has its own budget; do not first apply the model-context budget.
+        let output = self.result.log_output();
+        let wall_time_seconds = self.wall_time.as_secs_f64();
+        let header = format!("Wall time: {wall_time_seconds:.4} seconds\nOutput:");
+        if output.is_empty() {
+            header
+        } else {
+            format!("{header}\n{output}")
+        }
     }
 
     fn success_for_logging(&self) -> bool {
@@ -136,13 +140,7 @@ impl McpToolOutput {
             }
         }
 
-        // This is the context-injection form, so keep it aligned with the
-        // function-call output truncation that conversation history already
-        // applies. Code-mode consumers still get the raw `CallToolResult`.
-        //
-        // The text is serialized again inside the Responses payload, so allow
-        // a small buffer for JSON escaping and wrapper overhead.
-        truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
+        payload
     }
 }
 
@@ -152,7 +150,7 @@ pub struct ToolSearchOutput {
 }
 
 impl ToolOutput for ToolSearchOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         let tools = self
             .tools
             .iter()
@@ -162,7 +160,7 @@ impl ToolOutput for ToolSearchOutput {
                 })
             })
             .collect();
-        telemetry_preview(&JsonValue::Array(tools).to_string())
+        JsonValue::Array(tools).to_string()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -191,6 +189,7 @@ pub struct FunctionToolOutput {
     pub body: Vec<FunctionCallOutputContentItem>,
     pub success: Option<bool>,
     pub post_tool_use_response: Option<JsonValue>,
+    pub(crate) provenance: ToolOutputProvenance,
 }
 
 impl FunctionToolOutput {
@@ -199,6 +198,25 @@ impl FunctionToolOutput {
             body: vec![FunctionCallOutputContentItem::InputText { text }],
             success,
             post_tool_use_response: None,
+            provenance: ToolOutputProvenance::Untrusted,
+        }
+    }
+
+    pub(crate) fn from_managed_artifact_text(text: String) -> Self {
+        Self {
+            body: vec![FunctionCallOutputContentItem::InputText { text }],
+            success: Some(true),
+            post_tool_use_response: None,
+            provenance: ToolOutputProvenance::ManagedArtifactRetrieval,
+        }
+    }
+
+    pub(crate) fn from_managed_artifact_reference_text(text: String) -> Self {
+        Self {
+            body: vec![FunctionCallOutputContentItem::InputText { text }],
+            success: Some(true),
+            post_tool_use_response: None,
+            provenance: ToolOutputProvenance::ManagedArtifactReference,
         }
     }
 
@@ -210,6 +228,7 @@ impl FunctionToolOutput {
             body: content,
             success,
             post_tool_use_response: None,
+            provenance: ToolOutputProvenance::Untrusted,
         }
     }
 
@@ -219,14 +238,16 @@ impl FunctionToolOutput {
 }
 
 impl ToolOutput for FunctionToolOutput {
-    fn log_preview(&self) -> String {
-        telemetry_preview(
-            &function_call_output_content_items_to_text(&self.body).unwrap_or_default(),
-        )
+    fn log_output(&self) -> String {
+        function_call_output_content_items_to_text(&self.body).unwrap_or_default()
     }
 
     fn success_for_logging(&self) -> bool {
         self.success.unwrap_or(true)
+    }
+
+    fn provenance(&self) -> ToolOutputProvenance {
+        self.provenance
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -249,8 +270,8 @@ impl ApplyPatchToolOutput {
 }
 
 impl ToolOutput for ApplyPatchToolOutput {
-    fn log_preview(&self) -> String {
-        telemetry_preview(&self.text)
+    fn log_output(&self) -> String {
+        self.text.clone()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -282,8 +303,8 @@ pub struct AbortedToolOutput {
 }
 
 impl ToolOutput for AbortedToolOutput {
-    fn log_preview(&self) -> String {
-        telemetry_preview(&self.message)
+    fn log_output(&self) -> String {
+        self.message.clone()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -324,16 +345,34 @@ pub struct ExecCommandToolOutput {
     pub original_token_count: Option<usize>,
     /// Bytes omitted by the output collection cap before model-facing truncation.
     pub output_omitted_bytes: Option<NonZeroUsize>,
+    /// True only when unified exec itself produced a managed artifact envelope.
+    pub output_artifact: bool,
     pub hook_command: Option<String>,
 }
 
 impl ToolOutput for ExecCommandToolOutput {
-    fn log_preview(&self) -> String {
-        telemetry_preview(&self.response_text())
+    fn log_output(&self) -> String {
+        // The telemetry budget must not inherit the model's output-token limit.
+        let mut output = String::from_utf8_lossy(&self.raw_output).into_owned();
+        if let Some(omitted_bytes) = self.output_omitted_bytes {
+            let marker = format_output_omission_marker(omitted_bytes.get());
+            if !output.contains(&marker) {
+                output = format!("{marker}\n{output}");
+            }
+        }
+        format!("{}\n{output}", self.response_header())
     }
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn provenance(&self) -> ToolOutputProvenance {
+        if self.output_artifact {
+            ToolOutputProvenance::ManagedArtifactReference
+        } else {
+            ToolOutputProvenance::Untrusted
+        }
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -367,7 +406,7 @@ impl ToolOutput for ExecCommandToolOutput {
         }
 
         Some(JsonValue::String(
-            self.truncated_output(self.model_output_max_tokens()),
+            self.truncated_output_with_policy(self.model_output_policy()),
         ))
     }
 
@@ -405,13 +444,24 @@ impl ToolOutput for ExecCommandToolOutput {
 }
 
 impl ExecCommandToolOutput {
-    fn model_output_max_tokens(&self) -> usize {
-        resolve_max_tokens(self.max_output_tokens).min(self.truncation_policy.token_budget())
+    fn model_output_policy(&self) -> TruncationPolicy {
+        let requested_policy = TruncationPolicy::Tokens(resolve_max_tokens(self.max_output_tokens));
+        if requested_policy.byte_budget() < self.truncation_policy.byte_budget() {
+            requested_policy
+        } else {
+            self.truncation_policy
+        }
     }
 
     pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
+        self.truncated_output_with_policy(TruncationPolicy::Tokens(max_tokens))
+    }
+
+    fn truncated_output_with_policy(&self, policy: TruncationPolicy) -> String {
         let text = String::from_utf8_lossy(&self.raw_output).to_string();
-        let policy = TruncationPolicy::Tokens(max_tokens);
+        if self.output_artifact {
+            return text;
+        }
         let Some(omitted_bytes) = self.output_omitted_bytes else {
             return formatted_truncate_text(&text, policy);
         };
@@ -439,7 +489,7 @@ impl ExecCommandToolOutput {
         )
     }
 
-    fn response_text(&self) -> String {
+    fn response_header(&self) -> String {
         let mut sections = Vec::new();
 
         if !self.chunk_id.is_empty() {
@@ -462,9 +512,33 @@ impl ExecCommandToolOutput {
         }
 
         sections.push("Output:".to_string());
-        sections.push(self.truncated_output(self.model_output_max_tokens()));
-
         sections.join("\n")
+    }
+
+    fn response_text(&self) -> String {
+        let raw = String::from_utf8_lossy(&self.raw_output).to_string();
+        if self.output_artifact {
+            let mut envelope: JsonValue = serde_json::from_str(&raw).unwrap_or_default();
+            envelope["execution"] = serde_json::json!({
+                "chunk_id": (!self.chunk_id.is_empty()).then_some(&self.chunk_id),
+                "wall_time_seconds": self.wall_time.as_secs_f64(),
+                "exit_code": self.exit_code,
+                "session_id": self.process_id,
+                "original_token_count": self.original_token_count,
+            });
+            return envelope.to_string();
+        }
+        let header = self.response_header();
+        let output = match self.max_output_tokens {
+            Some(max_tokens) => self.truncated_output(max_tokens),
+            None => match self.output_omitted_bytes {
+                Some(omitted) if !raw.contains(&format_output_omission_marker(omitted.get())) => {
+                    format!("{}\n{raw}", format_output_omission_marker(omitted.get()))
+                }
+                Some(_) | None => raw,
+            },
+        };
+        format!("{header}\n{output}")
     }
 }
 
@@ -493,46 +567,6 @@ fn function_tool_response(
         call_id: call_id.to_string(),
         output: FunctionCallOutputPayload { body, success },
     }
-}
-
-fn telemetry_preview(content: &str) -> String {
-    let truncated_slice = take_bytes_at_char_boundary(content, TELEMETRY_PREVIEW_MAX_BYTES);
-    let truncated_by_bytes = truncated_slice.len() < content.len();
-
-    let mut preview = String::new();
-    let mut lines_iter = truncated_slice.lines();
-    for idx in 0..TELEMETRY_PREVIEW_MAX_LINES {
-        match lines_iter.next() {
-            Some(line) => {
-                if idx > 0 {
-                    preview.push('\n');
-                }
-                preview.push_str(line);
-            }
-            None => break,
-        }
-    }
-    let truncated_by_lines = lines_iter.next().is_some();
-
-    if !truncated_by_bytes && !truncated_by_lines {
-        return content.to_string();
-    }
-
-    if preview.len() < truncated_slice.len()
-        && truncated_slice
-            .as_bytes()
-            .get(preview.len())
-            .is_some_and(|byte| *byte == b'\n')
-    {
-        preview.push('\n');
-    }
-
-    if !preview.is_empty() && !preview.ends_with('\n') {
-        preview.push('\n');
-    }
-    preview.push_str(TELEMETRY_PREVIEW_TRUNCATION_NOTICE);
-
-    preview
 }
 
 #[cfg(test)]

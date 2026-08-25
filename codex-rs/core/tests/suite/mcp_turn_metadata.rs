@@ -4,6 +4,7 @@
 use anyhow::Result;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_config::types::AppToolApproval;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
@@ -20,6 +21,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ElicitationAction;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -111,23 +113,20 @@ async fn submit_user_turn(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.cwd.path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 collaboration_mode: collaboration_mode.or({
-                    Some(codex_protocol::config_types::CollaborationMode {
-                        mode: codex_protocol::config_types::ModeKind::Default,
-                        settings: codex_protocol::config_types::Settings {
+                    Some(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
                             model: session_model,
                             reasoning_effort: None,
                             developer_instructions: None,
@@ -135,8 +134,8 @@ async fn submit_user_turn(
                     })
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     Ok(())
 }
@@ -197,23 +196,37 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
             ev_completed("resp-permissions"),
         ]));
     }
-    response_sequence.extend([
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_function_call_with_namespace(
-                call_id,
-                SEARCH_CALENDAR_NAMESPACE,
-                SEARCH_CALENDAR_CREATE_TOOL,
-                &calendar_args,
+    response_sequence.push(sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call_with_namespace(
+            call_id,
+            SEARCH_CALENDAR_NAMESPACE,
+            SEARCH_CALENDAR_CREATE_TOOL,
+            &calendar_args,
+        ),
+        ev_completed("resp-1"),
+    ]));
+    if strict_auto_review {
+        response_sequence.push(sse(vec![
+            ev_response_created("resp-guardian-review"),
+            ev_assistant_message(
+                "msg-guardian-review",
+                &json!({
+                    "risk_level": "low",
+                    "user_authorization": "high",
+                    "outcome": "allow",
+                    "rationale": "Creating this calendar event is low risk.",
+                })
+                .to_string(),
             ),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_response_created("resp-2"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-2"),
-        ]),
-    ]);
+            ev_completed("resp-guardian-review"),
+        ]));
+    }
+    response_sequence.push(sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]));
     let mock = mount_sse_sequence(&server, response_sequence).await;
 
     let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url.clone())
@@ -284,26 +297,28 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
     };
     assert_eq!(begin.call_id, call_id);
 
-    let EventMsg::ElicitationRequest(request) = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::ElicitationRequest(_) | EventMsg::TurnComplete(_)
-        )
-    })
-    .await
-    else {
-        panic!("expected apps._default user to route the app approval to the user");
-    };
-
-    test.codex
-        .submit(Op::ResolveElicitation {
-            server_name: request.server_name,
-            request_id: request.id,
-            decision: ElicitationAction::Accept,
-            content: None,
-            meta: None,
+    if !strict_auto_review {
+        let EventMsg::ElicitationRequest(request) = wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::ElicitationRequest(_) | EventMsg::TurnComplete(_)
+            )
         })
-        .await?;
+        .await
+        else {
+            panic!("expected apps._default user to route the app approval to the user");
+        };
+
+        test.codex
+            .submit(Op::ResolveElicitation {
+                server_name: request.server_name,
+                request_id: request.id,
+                decision: ElicitationAction::Accept,
+                content: None,
+                meta: None,
+            })
+            .await?;
+    }
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -311,7 +326,10 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
     .await;
 
     let response_requests = mock.requests();
-    assert_eq!(response_requests.len(), 2 + usize::from(strict_auto_review));
+    assert_eq!(
+        response_requests.len(),
+        2 + 2 * usize::from(strict_auto_review)
+    );
     let response_body = response_requests[0].body_json();
     let turn_id = response_body["client_metadata"]["turn_id"]
         .as_str()
@@ -336,7 +354,7 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
     assert_eq!(
         apps_tool_call
             .pointer("/params/_meta/x-codex-turn-metadata/user_input_requested_during_turn"),
-        Some(&json!(true))
+        (!strict_auto_review).then_some(&json!(true))
     );
 
     Ok(())
@@ -450,8 +468,9 @@ async fn apps_default_prompt_with_auto_review_routes_actual_mcp_approval_to_guar
         .into_iter()
         .find(|request| {
             request
-                .instructions_text()
-                .starts_with("You are judging one planned coding-agent action.")
+                .message_input_texts("developer")
+                .iter()
+                .any(|text| text.starts_with("You are judging one planned coding-agent action."))
         })
         .expect("expected a Guardian request for the app MCP approval");
     assert!(guardian_request.body_contains_text("calendar_create_event"));

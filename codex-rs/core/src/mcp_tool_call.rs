@@ -59,6 +59,7 @@ use codex_protocol::mcp_approval_meta::TOOL_DESCRIPTION_KEY as MCP_TOOL_APPROVAL
 use codex_protocol::mcp_approval_meta::TOOL_PARAMS_DISPLAY_KEY as MCP_TOOL_APPROVAL_TOOL_PARAMS_DISPLAY_KEY;
 use codex_protocol::mcp_approval_meta::TOOL_PARAMS_KEY as MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY;
 use codex_protocol::mcp_approval_meta::TOOL_TITLE_KEY as MCP_TOOL_APPROVAL_TOOL_TITLE_KEY;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::McpInvocation;
@@ -82,6 +83,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use toml_edit::value;
 use tracing::Instrument;
 use tracing::Span;
@@ -108,9 +110,11 @@ const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
 /// item lifecycle events to the `Session`.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_tool_call(
     sess: Arc<Session>,
     step_context: &Arc<StepContext>,
+    cancellation_token: &CancellationToken,
     call_id: String,
     tool_info: &ToolInfo,
     hook_tool_name: HookToolName,
@@ -233,12 +237,14 @@ pub(crate) async fn handle_mcp_tool_call(
     if let Some(decision) = maybe_request_mcp_tool_approval(
         &sess,
         step_context,
+        cancellation_token,
         &call_id,
         &invocation,
         &invocation_tool_name,
         &hook_tool_name,
         &metadata,
         prepared_call.config(),
+        prepared_call.permission_profile(),
         approval_policy,
     )
     .await
@@ -283,7 +289,7 @@ pub(crate) async fn handle_mcp_tool_call(
                     &call_id,
                     invocation,
                     item_metadata.clone(),
-                    crate::guardian::guardian_timeout_message(),
+                    crate::guardian::guardian_timeout_message(turn_context.model_info()),
                     /*already_started*/ true,
                 )
                 .await
@@ -409,7 +415,7 @@ async fn handle_approved_mcp_tool_call(
     let result = async {
         let result = async {
             let result = prepared_call
-                .call_with_preparation(|| async {
+                .call_with_preparation(/*requested_timeout*/ None, || async {
                     if let McpToolApprovalApplication::Apply { decision, policy } =
                         &approval_application
                     {
@@ -445,7 +451,7 @@ async fn handle_approved_mcp_tool_call(
                         .map(|(connector_id, action_name)| HostedFileUploadContext {
                             connector_id: connector_id.clone(),
                             action_name: action_name.clone(),
-                            model: turn_context.model_info.slug.clone(),
+                            model: turn_context.model_info().slug.clone(),
                         });
                     let rewritten_arguments = rewrite_mcp_tool_arguments_for_openai_files(
                         sess,
@@ -487,7 +493,7 @@ async fn handle_approved_mcp_tool_call(
                 .await
                 .map_err(|error| format!("tool call error: {error:?}"))?;
             let result = sanitize_mcp_tool_result_for_model(
-                &turn_context.model_info.input_modalities,
+                &turn_context.model_info().input_modalities,
                 Ok(result),
             )?;
             Ok(maybe_request_codex_apps_auth_elicitation(
@@ -769,9 +775,10 @@ async fn augment_mcp_tool_request_meta_with_sandbox_state(
     else {
         return Ok(meta);
     };
-    let permission_profile = prepared_call.config().permission_profile.clone();
+    // TODO(anp): Build this metadata from the server's captured
+    // TurnEnvironment::sandbox_context instead of the runtime-wide Landlock value.
     let sandbox_state = serde_json::to_value(SandboxState {
-        permission_profile,
+        permission_profile: prepared_call.permission_profile().clone(),
         codex_linux_sandbox_exe: prepared_call.config().codex_linux_sandbox_exe.clone(),
         sandbox_cwd,
         use_legacy_landlock: prepared_call.config().use_legacy_landlock,
@@ -802,7 +809,7 @@ fn sandbox_cwd_for_mcp_server(step_context: &StepContext, environment_id: &str) 
     if let Some(environment) = step_context
         .environments
         .turn_environments()
-        .find(|environment| environment.environment_id == environment_id)
+        .find(|environment| environment.selection.environment_id == environment_id)
     {
         return Some(environment.cwd().clone());
     }
@@ -1017,7 +1024,7 @@ async fn maybe_track_codex_app_used(
     };
 
     let tracking = build_track_events_context(
-        turn_context.model_info.slug.clone(),
+        turn_context.model_info().slug.clone(),
         sess.thread_id.to_string(),
         turn_context.sub_id.clone(),
         turn_context.originator.clone(),
@@ -1187,7 +1194,7 @@ fn build_mcp_tool_call_request_meta(
     if let Some(turn_metadata) = turn_context
         .turn_metadata_state
         .current_meta_value_for_mcp_request(McpTurnMetadataContext {
-            model: turn_context.model_info.slug.as_str(),
+            model: turn_context.model_info().slug.as_str(),
             reasoning_effort: turn_context.effective_reasoning_effort(),
         })
     {
@@ -1288,34 +1295,48 @@ fn mcp_tool_approval_prompt_options(
 async fn maybe_request_mcp_tool_approval(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
+    cancellation_token: &CancellationToken,
     call_id: &str,
     invocation: &McpInvocation,
     invocation_tool_name: &ToolName,
     hook_tool_name: &HookToolName,
     metadata: &McpToolApprovalMetadata,
     config: &codex_mcp::McpConfig,
+    permission_profile: &PermissionProfile,
     policy: McpToolApprovalPolicy,
 ) -> Option<ReviewDecision> {
     let turn_context = &step_context.turn;
+    let turn_state = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|active| Arc::clone(&active.turn_state));
+    let strict_auto_review = match turn_state {
+        Some(turn_state) => turn_state.lock().await.strict_auto_review_enabled(),
+        None => false,
+    };
     let approvals_reviewer = connectors::mcp_approvals_reviewer_from_layers(
         &config.config_layer_stack,
         config.approvals_reviewer,
-        Some(turn_context.model_info.slug.as_str()),
+        Some(turn_context.model_info().slug.as_str()),
         &invocation.server,
         metadata.connector_id.as_deref(),
     );
-    if mcp_permission_prompt_is_auto_approved(
-        config.approval_policy.value(),
-        &config.permission_profile,
-        McpPermissionPromptAutoApproveContext {
-            tool_approval_mode: Some(policy.mode),
-        },
-    ) {
+    if !strict_auto_review
+        && mcp_permission_prompt_is_auto_approved(
+            config.approval_policy.value(),
+            permission_profile,
+            McpPermissionPromptAutoApproveContext {
+                tool_approval_mode: Some(policy.mode),
+            },
+        )
+    {
         return None;
     }
 
     let annotations = metadata.annotations.as_ref();
-    if !requires_mcp_tool_approval_for_mode(annotations, policy.mode) {
+    if !strict_auto_review && !requires_mcp_tool_approval_for_mode(annotations, policy.mode) {
         return None;
     }
 
@@ -1326,7 +1347,8 @@ async fn maybe_request_mcp_tool_approval(
     } else {
         None
     };
-    if let Some(key) = session_approval_key.as_ref()
+    if !strict_auto_review
+        && let Some(key) = session_approval_key.as_ref()
         && mcp_tool_approval_is_remembered(sess, key).await
     {
         return Some(ReviewDecision::Approved);
@@ -1362,9 +1384,10 @@ async fn maybe_request_mcp_tool_approval(
     };
     let approval_context = ApprovalContext {
         review_context: GuardianReviewContext::from(step_context),
+        cancellation_token: Some(cancellation_token.clone()),
         call_id: call_id.to_string(),
         tool_name: invocation_tool_name.clone(),
-        strict_auto_review: false,
+        strict_auto_review,
         approval_reason: None,
         retry_reason: None,
         network_approval_context: None,

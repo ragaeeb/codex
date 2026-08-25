@@ -5,7 +5,6 @@ bazel_dep(name = "platforms", version = "1.0.0")
 
 # Expose the public protobuf rules already used transitively by rules_rs.
 bazel_dep(name = "protobuf", version = "34.0.bcr.1", repo_name = "com_google_protobuf")
-bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "llvm", version = "0.8.11")
 bazel_dep(name = "windows_support", version = "0.2.0")
 
@@ -152,6 +151,7 @@ single_version_override(
     patch_strip = 1,
     patches = [
         "//patches:rules_rs_build_script_deps_annotation.patch",
+        "//patches:rules_rs_windows_msvc_linker.patch",
     ],
     version = "0.0.96",
 )
@@ -162,8 +162,8 @@ rules_rust.patch(
         # Carry the OpenAI setup fix that makes build-script tools available
         # through their runfiles after the rules_rs upgrade.
         "//patches:rules_rust_build_script_tools_transition.patch",
-        # Keep direct Windows/MSVC links compatible with hermetic LLVM's
-        # non-.lib runtime artifacts.
+        # Prefer Rust's direct linker for Windows/MSVC and keep hermetic
+        # LLVM's non-.lib runtime artifacts compatible with it.
         "//patches:rules_rust_windows_msvc_direct_link_args.patch",
         # Skip transient native-Windows linker outputs while consolidating
         # dependency search paths.
@@ -426,6 +426,24 @@ crate.annotation(
 )
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+codex_release_archive = use_extension(
+    "//bazel/extensions:codex_release_archive.bzl",
+    "codex_release_archive",
+)
+codex_release_archive.release(
+    sha256 = "1e8531ae5f6dea3c6e11e53e74cc5ac81bf1ba597f9b296fb112d6ea30fdaf5d",
+    version = "0.149.1",
+)
+codex_release_archive.release(
+    sha256 = "71a28d362c96ac9829bf8203a2c71be451aeb726adb843167fdaf0eae8fe7dd9",
+    version = "0.145.0",
+)
+use_repo(
+    codex_release_archive,
+    "codex_release_0.145.0_linux_x86_64",
+    "codex_release_0.149.1_linux_x86_64",
+)
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 

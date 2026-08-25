@@ -35,6 +35,100 @@ fn response_item_envelope_accessors_preserve_item() {
 }
 
 #[test]
+fn artifact_reference_metadata_is_bounded_at_the_history_boundary() {
+    let metadata = CodexHarnessMetadata::default().with_store_backed_artifact_references(
+        (0..(MAX_STORE_BACKED_ARTIFACT_REFERENCES + 32)).map(|index| format!("out_{index:064x}")),
+    );
+    assert_eq!(
+        metadata.store_backed_artifact_references().len(),
+        MAX_STORE_BACKED_ARTIFACT_REFERENCES
+    );
+
+    let serialized = serde_json::to_value(&metadata).expect("metadata should serialize");
+    let restored: CodexHarnessMetadata = serde_json::from_value(serialized).expect("metadata");
+    assert_eq!(
+        restored.store_backed_artifact_references().len(),
+        MAX_STORE_BACKED_ARTIFACT_REFERENCES
+    );
+}
+
+#[test]
+fn argument_repair_receipt_is_bounded_and_kept_outside_raw_item() -> Result<()> {
+    let receipt = ToolArgumentRepairReceipt {
+        tool_family: ToolArgumentRepairToolFamily::ReadFile,
+        outcome: ToolArgumentRepairOutcome::Repaired,
+        rules: (0..(MAX_TOOL_ARGUMENT_REPAIR_RULES + 3))
+            .map(|_| "numeric_string_typed".to_string())
+            .chain(["secret_rule".to_string()])
+            .collect(),
+        input_bytes: MAX_TOOL_ARGUMENT_REPAIR_BYTES + 1,
+        effective_bytes: MAX_TOOL_ARGUMENT_REPAIR_BYTES + 2,
+        candidate_work: usize::MAX,
+        repair_duration_micros: u64::MAX,
+        reason: None,
+    };
+    let raw_item = response_message("user");
+    let line = RolloutLine {
+        timestamp: "2025-01-03T12:00:00.000Z".to_string(),
+        ordinal: Some(8),
+        item: RolloutItem::ResponseItem(ResponseItemEnvelope {
+            item: raw_item.clone(),
+            metadata: Some(CodexHarnessMetadata::default().with_tool_argument_repair(receipt)),
+        }),
+    };
+
+    let mut serialized = serde_json::to_value(&line)?;
+    assert_eq!(serialized["payload"], serde_json::to_value(&raw_item)?);
+    assert_eq!(
+        serialized["metadata"]["tool_argument_repair"]["rules"]
+            .as_array()
+            .expect("serialized rules")
+            .len(),
+        MAX_TOOL_ARGUMENT_REPAIR_RULES
+    );
+    serialized["metadata"]["tool_argument_repair"]["candidate_work"] = json!(usize::MAX);
+    serialized["metadata"]["tool_argument_repair"]["repair_duration_micros"] = json!(u64::MAX);
+    serialized["metadata"]["tool_argument_repair"]["rules"] =
+        json!(["numeric_string_typed", "secret_rule"]);
+    let restored = serde_json::from_value::<RolloutLine>(serialized)?;
+    let RolloutItem::ResponseItem(envelope) = restored.item else {
+        panic!("expected response item");
+    };
+    let receipt = envelope
+        .metadata
+        .expect("repair metadata")
+        .tool_argument_repair()
+        .cloned()
+        .expect("repair receipt");
+    assert_eq!(receipt.rules.len(), 1);
+    assert_eq!(receipt.input_bytes, MAX_TOOL_ARGUMENT_REPAIR_BYTES);
+    assert_eq!(receipt.effective_bytes, MAX_TOOL_ARGUMENT_REPAIR_BYTES);
+    assert_eq!(
+        receipt.candidate_work,
+        MAX_TOOL_ARGUMENT_REPAIR_CANDIDATE_WORK
+    );
+    assert_eq!(
+        receipt.repair_duration_micros,
+        MAX_TOOL_ARGUMENT_REPAIR_DURATION_MICROS
+    );
+    assert_eq!(receipt.rules, ["numeric_string_typed"]);
+    assert_eq!(envelope.item, raw_item);
+    Ok(())
+}
+
+#[test]
+fn argument_repair_receipt_rejects_unbounded_serialized_rule_sequences() {
+    let value = json!({
+        "tool_family": "read_file",
+        "outcome": "repaired",
+        "rules": vec!["numeric_string_typed"; MAX_TOOL_ARGUMENT_REPAIR_RULES + 1],
+    });
+    let error = serde_json::from_value::<ToolArgumentRepairReceipt>(value)
+        .expect_err("oversized persisted rule sequences must fail closed");
+    assert!(error.to_string().contains("invalid length"), "{error}");
+}
+
+#[test]
 /// Keeps legacy response-item rollout lines readable and byte-shape compatible.
 fn response_item_rollout_line_preserves_shape() -> Result<()> {
     let legacy_line = json!({
@@ -72,6 +166,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             item: response_item.clone(),
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
+                ..Default::default()
             }),
         }),
     };
@@ -97,6 +192,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         envelope.metadata,
         Some(CodexHarnessMetadata {
             client_authored: true,
+            ..Default::default()
         })
     );
     Ok(())
@@ -184,10 +280,12 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
                 item: developer_message.clone(),
                 metadata: Some(CodexHarnessMetadata {
                     client_authored: true,
+                    ..Default::default()
                 }),
             },
             ResponseItemEnvelope::new(compaction_item.clone()),
         ]),
+        mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
@@ -215,6 +313,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
                 item: developer_message,
                 metadata: Some(CodexHarnessMetadata {
                     client_authored: true,
+                    ..Default::default()
                 }),
             },
             ResponseItemEnvelope {
@@ -276,6 +375,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         item: response_item.clone(),
         metadata: Some(CodexHarnessMetadata {
             client_authored: true,
+            ..Default::default()
         }),
     };
     let response_line = serde_json::to_value(RolloutItem::ResponseItem(envelope.clone()))?;
@@ -289,6 +389,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
     let compacted_line = serde_json::to_value(RolloutItem::Compacted(CompactedItem {
         message: "summary".to_string(),
         replacement_history: Some(vec![envelope]),
+        mcp_resource_origins: Some(McpResourceOriginCheckpoint::default()),
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
@@ -353,8 +454,27 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
             "payload": { "full": true, "state": { "cwd": "/tmp" } },
         }),
         json!({
+            "type": "security_risk_score",
+            "payload": {
+                "scores": {
+                    "action_risk": 0.92,
+                    "data_exfiltration": 0.31,
+                },
+            },
+        }),
+        json!({
             "type": "event_msg",
             "payload": { "type": "warning", "message": "heads up" },
+        }),
+        json!({
+            "type": "realtime_item",
+            "payload": {
+                "id": "segment-1",
+                "realtime_session_id": "session-1",
+                "type": "transcript_segment",
+                "role": "assistant",
+                "text": "hello",
+            },
         }),
     ];
 
@@ -370,7 +490,7 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
 fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<()> {
     let schema = serde_json::to_value(schemars::schema_for!(RolloutItem))?;
     let variants = schema["oneOf"].as_array().expect("rollout variants");
-    assert_eq!(variants.len(), 8);
+    assert_eq!(variants.len(), 10);
 
     for variant in variants {
         let required = variant["required"].as_array().expect("required fields");
@@ -421,6 +541,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
     let item = CompactedItem {
         message: "summary".to_string(),
         replacement_history: None,
+        mcp_resource_origins: None,
         window_number: Some(3),
         first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
         previous_window_id: Some("019b3f6e-0000-7000-8000-000000000002".to_string()),
@@ -453,6 +574,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
         CompactedItem {
             message: "summary".to_string(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: Some(3),
             first_window_id: None,
             previous_window_id: None,

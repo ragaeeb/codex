@@ -9,10 +9,17 @@ workspace = true
 
 [dependencies]
 codex-protocol = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
 codex-utils-string = { workspace = true }
+fslock = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lib]
 doctest = false

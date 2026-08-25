@@ -82,6 +82,8 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::EventMsg(_) => ThreadHistoryChangeSet::default(),
     }
 }

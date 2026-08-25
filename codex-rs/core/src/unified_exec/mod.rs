@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -35,6 +36,7 @@ use codex_utils_path_uri::PathUri;
 use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
@@ -43,6 +45,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::network_approval::DeferredNetworkApproval;
+use codex_core_plugins::PluginMetricsSidecar;
 
 mod async_watcher;
 mod errors;
@@ -50,6 +53,7 @@ mod head_tail_buffer;
 mod process;
 mod process_manager;
 mod process_state;
+mod shell_snapshot;
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
@@ -70,20 +74,108 @@ pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+pub(crate) const MAX_RECOVERABLE_EXEC_OUTPUT_BYTES: usize = 2 * UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
+
+async fn recoverable_output(
+    session: Option<&Session>,
+    turn: Option<&TurnContext>,
+    output: &mut head_tail_buffer::HeadTailBuffer,
+    spill: bool,
+) -> (Vec<u8>, Option<NonZeroUsize>, bool) {
+    let original_bytes = output.total_bytes();
+    let omitted = NonZeroUsize::new(output.omitted_bytes());
+    let envelope_budget = turn.map_or(4 * 1024, |turn| {
+        turn.tool_output_truncation_policy()
+            .byte_budget()
+            .min(codex_history::STORE_BACKED_TOOL_OUTPUT_MAX_BYTES)
+    });
+    if envelope_budget < crate::tool_output::MIN_ARTIFACT_ENVELOPE_BYTES {
+        // A producer must not publish an identity-only handle that read_tool_output cannot fit
+        // and advance under the same policy. Keep the bounded preview inline and let the normal
+        // projector apply the active policy; do not create an orphan store entry.
+        return (output.to_bytes_with_omission_marker(), omitted, false);
+    }
+    if let Some(session) = session
+        && session.output_artifact_spilling_supported()
+        && (spill || omitted.is_some())
+        && let Some(bytes) = output.take_complete_bytes()
+    {
+        match session
+            .output_artifact_store()
+            .await
+            .store_bytes(&bytes)
+            .await
+        {
+            Ok(artifact) => {
+                let Some(envelope) = artifact.try_envelope("text/plain", envelope_budget) else {
+                    return (bytes, omitted, false);
+                };
+                if let Some(turn) = turn {
+                    crate::session::record_tool_output_projection(
+                        turn,
+                        &crate::tool_output::ProjectionMeasurement {
+                            original_bytes,
+                            inline_bytes: envelope.len(),
+                            outcome: "spilled",
+                            rule: if artifact.reused {
+                                "exact_digest_reuse_v1"
+                            } else {
+                                "spill_v1"
+                            },
+                            tool_family: "exec",
+                        },
+                    );
+                }
+                return (envelope.into_bytes(), None, true);
+            }
+            Err(err) => tracing::warn!(
+                error_kind = ?err.kind(),
+                "unified exec output spill failed; using bounded truncation"
+            ),
+        }
+    }
+    let bytes = output.to_bytes_with_omission_marker();
+    if (spill || omitted.is_some() || output.capture_limit_exceeded())
+        && let Some(turn) = turn
+    {
+        crate::session::record_tool_output_projection(
+            turn,
+            &crate::tool_output::ProjectionMeasurement {
+                original_bytes,
+                inline_bytes: bytes.len(),
+                outcome: "fallback",
+                rule: if output.capture_limit_exceeded() {
+                    "capture_quota_fallback_v1"
+                } else {
+                    "spill_failure_truncate_v1"
+                },
+                tool_family: "exec",
+            },
+        );
+    }
+    (bytes, omitted, false)
+}
 
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
     pub step_context: Arc<StepContext>,
+    pub cancellation_token: CancellationToken,
     pub call_id: String,
 }
 
 impl UnifiedExecContext {
-    pub fn new(session: Arc<Session>, step_context: Arc<StepContext>, call_id: String) -> Self {
+    pub fn new(
+        session: Arc<Session>,
+        step_context: Arc<StepContext>,
+        cancellation_token: CancellationToken,
+        call_id: String,
+    ) -> Self {
         Self {
             session,
             step_context,
+            cancellation_token,
             call_id,
         }
     }
@@ -167,6 +259,7 @@ impl Default for UnifiedExecProcessManager {
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
+    plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
     call_id: String,
     process_id: i32,
     cwd: PathUri,
@@ -176,6 +269,17 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+}
+
+type SharedPluginMetricsSidecar = Arc<std::sync::Mutex<Option<PluginMetricsSidecar>>>;
+
+fn take_plugin_metrics_sidecar(
+    sidecar: &SharedPluginMetricsSidecar,
+) -> Option<PluginMetricsSidecar> {
+    sidecar
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {

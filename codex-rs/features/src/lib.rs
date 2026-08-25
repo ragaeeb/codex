@@ -21,6 +21,10 @@ pub use feature_configs::CodeModeHostConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
 pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
+pub use feature_configs::GuardianV2ConfigToml;
+pub use feature_configs::GuardianV2ReviewScopeConfigToml;
+pub use feature_configs::GuardianV2TranscriptConfigToml;
+pub use feature_configs::GuardianV2TranscriptSource;
 pub use feature_configs::MultiAgentV2ConfigToml;
 pub use feature_configs::NetworkProxyConfigToml;
 pub use feature_configs::NetworkProxyDomainPermissionToml;
@@ -84,6 +88,8 @@ impl Stage {
 /// Unique features toggled via configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
+    /// Enable the interactive transcript composer and turn-selection UI.
+    TranscriptV2,
     // Stable.
     /// Enable the default shell tool.
     ShellTool,
@@ -95,14 +101,20 @@ pub enum Feature {
     SecretAuthStorage,
 
     // Experimental
+    /// Send per-content-entry classifications in internal Responses metadata.
+    ContentItemKinds,
     /// Record model-attempted tool calls in internal Responses metadata.
     ExecutedToolCallMetadata,
+    /// Repair a bounded allowlist of malformed first-party function arguments before dispatch.
+    ToolArgumentRepair,
     /// Enable JavaScript code mode backed by the standalone host process.
     CodeMode,
     /// Removed compatibility flag for the configurable code-mode exec yield timeout.
     CodeModeBufferedExec,
     /// Run JavaScript code mode in the standalone host process.
     CodeModeHost,
+    /// Establish the code-mode host connection during session startup.
+    CodeModePrewarm,
     /// Terminate active code mode cells when their turn is interrupted.
     CodeModeInterrupt,
     /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
@@ -141,8 +153,12 @@ pub enum Feature {
     UseLegacyLandlock,
     /// Experimental shell snapshotting.
     ShellSnapshot,
+    /// Keep policy-filtered shell snapshots entirely in executor memory.
+    ShellSnapshotV2,
     /// Allow turns to start while selected executors are still starting.
     DeferredExecutor,
+    /// Use the current working directory for turn diff display paths.
+    CwdRelativeTurnDiffs,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
     /// Enable startup memory extraction and file-backed memory consolidation.
@@ -157,6 +173,8 @@ pub enum Feature {
     Chronicle,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
+    /// Keep active sampling turns alive until a failed network connection recovers.
+    UnboundedConnectionRetries,
     /// Start the managed network proxy for sandboxed sessions.
     NetworkProxy,
     /// Respect host system proxy settings for Codex-owned network clients.
@@ -195,12 +213,26 @@ pub enum Feature {
     Plugins,
     /// Discover selected-root plugin and skill manifests through one high-level exec-server RPC.
     ExecutorCapabilityDiscovery,
+    /// Skip host skill snapshots when no registered contributor requires them.
+    SkipHostSkillDiscovery,
     /// Removed compatibility flag for plugin-bundled lifecycle hooks.
     PluginHooks,
     /// Allow the in-app browser pane in desktop apps.
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
     InAppBrowser,
+    /// Allow the in-app chat pane in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppChat,
+    /// Allow in-app dictation in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppDictation,
+    /// Allow desktop apps to run local automations.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppLocalAutomation,
     /// Allow desktop apps to perform in-app updates.
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
@@ -243,18 +275,28 @@ pub enum Feature {
     SkillMcpDependencyInstall,
     /// Run cheap skill-search methods in shadow mode and emit experiment metrics.
     SkillSearch,
+    /// Use stable, description-compacted skill catalog rendering.
+    SkillCatalogSelection,
     /// Removed compatibility flag for deleted skill env var dependency prompting.
     SkillEnvVarDependencyPrompt,
     /// Enable the unified mention popup used by default in the TUI.
     MentionsV2,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
+    /// Removed compatibility flag for model-enabled async user messaging.
+    SendAsyncMessage,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
     /// Reuse encrypted parent compaction when restarting Guardian review sessions.
     GuardianReuseParentCompaction,
+    /// Include completed node_repl or cua_repl Code Mode responses in Guardian reviews.
+    GuardianEnhancedNodeReplTranscripts,
+    /// Include completed node_repl or cua_repl Code Mode response images in Guardian reviews.
+    GuardianNodeReplTranscriptImages,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
+    /// Enable the extension-owned synchronous Guardian reviewer.
+    GuardianExt,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
     /// Add current context-window metadata to model-visible context.
@@ -267,18 +309,26 @@ pub enum Feature {
     ToolCallMcpElicitation,
     /// Prompt Codex Apps connector auth failures through MCP URL elicitations.
     AuthElicitation,
+    /// Offer Amazon Bedrock setup during TUI sign-in onboarding.
+    BedrockSetupWizard,
     /// Enable personality selection in the TUI.
     Personality,
     /// Enable native artifact tools.
     Artifact,
+    /// Enable the bounded first-party read_file tool.
+    NativeReadFile,
     /// Enable Fast mode selection in the TUI and request layer.
     FastMode,
+    /// Enable explicitly requested model changes for later step captures.
+    StepModelSwitching,
     /// Enable experimental realtime voice conversation mode in the TUI.
     RealtimeConversation,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
     /// Enable remote compaction v2 over the normal Responses API.
     RemoteCompactionV2,
+    /// Include retained images in the remote compaction context budget.
+    CompactionImageBudget,
     /// Retain client-authored developer messages across compacted context windows.
     RetainClientDeveloperMessages,
     /// Use Agent Identity for ChatGPT-authenticated sessions.
@@ -685,6 +735,12 @@ pub struct FeaturesToml {
     pub code_mode_host: Option<FeatureToml<CodeModeHostConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub non_prefixed_mcp_tool_names: Option<FeatureToml<NonPrefixedMcpToolNamesConfigToml>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "feature_configs::deserialize_guardian_v2_feature"
+    )]
+    pub guardianv2: Option<FeatureToml<GuardianV2ConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -724,6 +780,9 @@ impl FeaturesToml {
             .and_then(FeatureToml::enabled)
         {
             entries.insert(Feature::NonPrefixedMcpToolNames.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self.guardianv2.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::GuardianV2.key().to_string(), enabled);
         }
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
@@ -791,6 +850,12 @@ pub struct FeatureSpec {
 }
 
 pub const FEATURES: &[FeatureSpec] = &[
+    FeatureSpec {
+        id: Feature::TranscriptV2,
+        key: "transcript_v2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
     // Stable features.
     FeatureSpec {
         id: Feature::GhostCommit,
@@ -820,7 +885,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::UnifiedExec,
         key: "unified_exec",
         stage: Stage::Stable,
-        default_enabled: !cfg!(windows),
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ShellZshFork,
@@ -831,8 +896,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::UnifiedExecZshFork,
         key: "unified_exec_zsh_fork",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Removed,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ShellSnapshot,
@@ -841,8 +906,20 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::ShellSnapshotV2,
+        key: "shell_snapshot_v2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::DeferredExecutor,
         key: "deferred_executor",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CwdRelativeTurnDiffs,
+        key: "cwd_relative_turn_diffs",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -853,10 +930,22 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ContentItemKinds,
+        key: "content_item_kinds",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::ExecutedToolCallMetadata,
         key: "executed_tool_call_metadata",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ToolArgumentRepair,
+        key: "tool_argument_repair",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CodeMode,
@@ -875,6 +964,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "code_mode_host",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::CodeModePrewarm,
+        key: "code_mode_prewarm",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::CodeModeInterrupt,
@@ -1051,6 +1146,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::UnboundedConnectionRetries,
+        key: "unbounded_connection_retries",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::NetworkProxy,
         key: "network_proxy",
         stage: Stage::Experimental {
@@ -1175,6 +1276,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::SkipHostSkillDiscovery,
+        key: "skip_host_skill_discovery",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::PluginHooks,
         key: "plugin_hooks",
         stage: Stage::Removed,
@@ -1183,6 +1290,24 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::InAppBrowser,
         key: "in_app_browser",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::InAppChat,
+        key: "in_app_chat",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::InAppDictation,
+        key: "in_app_dictation",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::InAppLocalAutomation,
+        key: "in_app_local_automation",
         stage: Stage::Stable,
         default_enabled: true,
     },
@@ -1283,6 +1408,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::SkillCatalogSelection,
+        key: "skill_catalog_selection",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::SkillEnvVarDependencyPrompt,
         key: "skill_env_var_dependency_prompt",
         stage: Stage::Removed,
@@ -1307,6 +1438,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::SendAsyncMessage,
+        key: "send_async_message",
+        stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::TerminalVisualizationInstructions,
         key: "terminal_visualization_instructions",
         stage: Stage::UnderDevelopment,
@@ -1325,8 +1462,26 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::GuardianEnhancedNodeReplTranscripts,
+        key: "guardian_enhanced_node_repl_transcripts",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianNodeReplTranscriptImages,
+        key: "guardian_node_repl_transcript_images",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::GuardianV2,
         key: "guardianv2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianExt,
+        key: "guardian_ext",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1373,6 +1528,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::BedrockSetupWizard,
+        key: "bedrock_setup_wizard",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::Personality,
         key: "personality",
         stage: Stage::Stable,
@@ -1385,10 +1546,22 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::NativeReadFile,
+        key: "native_read_file",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::FastMode,
         key: "fast_mode",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::StepModelSwitching,
+        key: "step_model_switching",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::RealtimeConversation,
@@ -1455,6 +1628,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "remote_compaction_v2",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::CompactionImageBudget,
+        key: "compaction_image_budget",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::RetainClientDeveloperMessages,

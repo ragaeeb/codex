@@ -1,4 +1,3 @@
-use super::head_tail_buffer::HeadTailBuffer;
 use super::*;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::environment_selection::TurnEnvironmentState;
@@ -10,6 +9,7 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
@@ -20,6 +20,7 @@ use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
 use codex_sandboxing::SandboxType;
+use codex_tools::ToolOutput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
@@ -28,7 +29,6 @@ use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::test_env as remote_test_env;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -127,6 +127,7 @@ async fn exec_command_with_tty(
     let context = UnifiedExecContext::new(
         Arc::clone(session),
         crate::session::step_context::StepContext::for_test(Arc::clone(turn)),
+        tokio_util::sync::CancellationToken::new(),
         "call".to_string(),
     );
     let started_at = Instant::now();
@@ -134,6 +135,7 @@ async fn exec_command_with_tty(
     if process_started_alive {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            plugin_metrics_sidecar: None,
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone().into(),
@@ -153,7 +155,7 @@ async fn exec_command_with_tty(
     }
 
     let deadline = started_at + Duration::from_millis(yield_time_ms);
-    let collected_output = UnifiedExecProcessManager::collect_output_until_deadline(
+    let mut collected_output = UnifiedExecProcessManager::collect_output_until_deadline(
         process.output_handles(),
         Some(session.subscribe_elicitation_pause_state()),
         deadline,
@@ -164,8 +166,13 @@ async fn exec_command_with_tty(
         collected_output.total_bytes(),
     ))
     .unwrap_or(usize::MAX);
-    let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-    let collected = collected_output.to_bytes_with_omission_marker();
+    let (collected, output_omitted_bytes, output_artifact) = recoverable_output(
+        Some(session.as_ref()),
+        Some(turn.as_ref()),
+        &mut collected_output,
+        /*spill*/ false,
+    )
+    .await;
     let has_exited = process.has_exited();
     let exit_code = process.exit_code();
     let response_process_id = if process_started_alive && !has_exited {
@@ -192,12 +199,13 @@ async fn exec_command_with_tty(
         chunk_id: generate_chunk_id(),
         wall_time,
         raw_output: collected,
-        truncation_policy: turn.model_info.truncation_policy.into(),
+        truncation_policy: turn.model_info().truncation_policy.into(),
         max_output_tokens: None,
         process_id: response_process_id,
         exit_code,
         original_token_count: Some(original_token_count),
         output_omitted_bytes,
+        output_artifact,
         hook_command: Some(cmd.to_string()),
     })
 }
@@ -323,7 +331,7 @@ async fn write_stdin(
 
 #[test]
 fn push_chunk_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
+    let mut buffer = HeadTailBuffer::<UNIFIED_EXEC_OUTPUT_MAX_BYTES>::default();
     buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
     buffer.push_chunk(vec![b'b']);
     buffer.push_chunk(vec![b'c']);
@@ -337,11 +345,123 @@ fn push_chunk_preserves_prefix_and_suffix() {
     assert_eq!(snapshot, vec![vec![b'a'; head_bytes], expected_tail]);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn oversized_shell_output_spills_complete_capture() {
+    let (session, turn) = test_session_and_turn().await;
+    let output = exec_command(
+        &session,
+        &turn,
+        "i=0; while [ \"$i\" -lt 70000 ]; do printf 'SHELL-%05d-middle\\n' \"$i\"; i=$((i + 1)); done",
+        /*yield_time_ms*/ 30_000,
+        /*workdir*/ None,
+    )
+    .await
+    .expect("exec output");
+    assert_eq!(
+        output.provenance(),
+        codex_tools::ToolOutputProvenance::ManagedArtifactReference
+    );
+    assert_eq!(output.output_omitted_bytes, None);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.raw_output).expect("envelope");
+    assert!(
+        envelope["original_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 1_048_576)
+    );
+    let id = codex_utils_output_truncation::OutputArtifactId::parse(
+        envelope["artifact_id"].as_str().expect("artifact id"),
+    )
+    .expect("valid artifact id");
+    let store = session.output_artifact_store().await;
+    let mut recovered = String::new();
+    let mut offset = 0;
+    loop {
+        let (text, _, _, next) = store
+            .read_bytes(
+                &id,
+                offset,
+                codex_utils_output_truncation::MAX_ARTIFACT_READ_BYTES,
+            )
+            .await
+            .expect("read artifact");
+        recovered.push_str(&text);
+        let Some(next) = next else { break };
+        offset = next;
+    }
+    assert!(recovered.contains("SHELL-35000-middle"));
+}
+
+#[tokio::test]
+async fn recoverable_shell_capture_falls_back_at_its_hard_quota() {
+    let (session, turn) = test_session_and_turn().await;
+    let mut buffer = HeadTailBuffer::new_recoverable(MAX_RECOVERABLE_EXEC_OUTPUT_BYTES);
+    buffer.push_chunk(vec![b'x'; MAX_RECOVERABLE_EXEC_OUTPUT_BYTES + 1]);
+
+    let (output, omitted, artifact) = recoverable_output(
+        Some(session.as_ref()),
+        Some(turn.as_ref()),
+        &mut buffer,
+        /*spill*/ true,
+    )
+    .await;
+
+    assert!(!artifact);
+    assert!(omitted.is_some());
+    assert!(output.len() < MAX_RECOVERABLE_EXEC_OUTPUT_BYTES);
+    assert!(String::from_utf8_lossy(&output).contains("bytes omitted"));
+}
+
+#[tokio::test]
+async fn recoverable_shell_capture_never_publishes_an_unusable_small_policy_handle() {
+    for (token_limit, budget) in [(32, 128_i64), (49, 196), (50, 200)] {
+        let (session, mut turn) = make_session_and_context().await;
+        Arc::get_mut(&mut turn.config)
+            .expect("test turn config should be uniquely owned")
+            .tool_output_token_limit = Some(token_limit);
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let mut buffer = HeadTailBuffer::new_recoverable(4 * 1024);
+        buffer.push_chunk(vec![b'x'; 2 * 1024]);
+
+        let (output, _, artifact) = recoverable_output(
+            Some(session.as_ref()),
+            Some(turn.as_ref()),
+            &mut buffer,
+            /*spill*/ true,
+        )
+        .await;
+
+        if budget < i64::try_from(crate::tool_output::MIN_ARTIFACT_ENVELOPE_BYTES).unwrap() {
+            assert!(
+                !artifact,
+                "small policy must not publish a retrieval handle"
+            );
+        }
+        if artifact {
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&output).expect("managed output envelope");
+            let id = codex_utils_output_truncation::OutputArtifactId::parse(
+                envelope["artifact_id"].as_str().expect("artifact id"),
+            )
+            .expect("valid artifact id");
+            assert!(
+                session
+                    .output_artifact_store()
+                    .await
+                    .artifact_size(&id)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+}
+
 #[test]
 fn head_tail_buffer_default_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
+    let mut buffer = HeadTailBuffer::<UNIFIED_EXEC_OUTPUT_MAX_BYTES>::default();
     buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
-    buffer.push_chunk(b"bc".to_vec());
+    buffer.push_chunk(b"bc");
 
     let rendered = buffer.to_bytes();
     assert_eq!(rendered.first(), Some(&b'a'));
@@ -607,6 +727,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
         process_id,
         ProcessEntry {
             process,
+            plugin_metrics_sidecar: None,
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),
@@ -680,6 +801,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
         process_id,
         ProcessEntry {
             process: Arc::clone(&process),
+            plugin_metrics_sidecar: None,
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),

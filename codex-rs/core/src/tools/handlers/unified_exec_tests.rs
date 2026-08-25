@@ -1,6 +1,7 @@
 use super::*;
 use crate::shell::ShellType;
 use crate::shell::default_user_shell;
+use crate::shell::get_shell;
 use codex_exec_server::Environment;
 use codex_tools::UnifiedExecShellMode;
 use codex_tools::ZshForkConfig;
@@ -95,7 +96,7 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
+fn test_get_command_resolves_powershell_by_type() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let powershell_path = temp_dir.path().join(if cfg!(windows) {
         "powershell.exe"
@@ -123,10 +124,13 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
         /*allow_login_shell*/ true,
     )
     .map_err(anyhow::Error::msg)?;
-    let command = resolved.command;
-
-    assert_eq!(command[2], "echo hello");
-    assert_eq!(resolved.shell_type, ShellType::PowerShell);
+    let expected_shell = get_shell(ShellType::PowerShell)
+        .unwrap_or_else(|| codex_shell_command::shell_detect::ultimate_fallback_shell().into());
+    assert_eq!(
+        resolved.command,
+        expected_shell.derive_exec_args("echo hello", /*use_login_shell*/ true)
+    );
+    assert_eq!(resolved.shell_type, expected_shell.shell_type);
     Ok(())
 }
 
@@ -183,7 +187,7 @@ async fn exec_command_rejects_login_when_selected_environment_disallows_it() {
     else {
         panic!("primary environment should be ready");
     };
-    environment.config.allow_login_shell = false;
+    environment.config_mut().allow_login_shell = false;
 
     let turn = Arc::new(turn);
     let invocation = ToolInvocation {
@@ -345,6 +349,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         exit_code: Some(0),
         original_token_count: None,
         output_omitted_bytes: None,
+        output_artifact: false,
         hook_command: Some("echo three".to_string()),
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
@@ -376,6 +381,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         exit_code: Some(0),
         original_token_count: None,
         output_omitted_bytes: None,
+        output_artifact: false,
         hook_command: Some("echo three".to_string()),
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
@@ -408,6 +414,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         exit_code: None,
         original_token_count: None,
         output_omitted_bytes: None,
+        output_artifact: false,
         hook_command: Some("echo three".to_string()),
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
@@ -435,6 +442,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         exit_code: Some(0),
         original_token_count: None,
         output_omitted_bytes: None,
+        output_artifact: false,
         hook_command: Some("sleep 1; echo finished".to_string()),
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
@@ -467,6 +475,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         exit_code: Some(0),
         original_token_count: None,
         output_omitted_bytes: None,
+        output_artifact: false,
         hook_command: Some("sleep 2; echo alpha".to_string()),
     };
     let output_b = ExecCommandToolOutput {
@@ -480,6 +489,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         exit_code: Some(0),
         original_token_count: None,
         output_omitted_bytes: None,
+        output_artifact: false,
         hook_command: Some("sleep 1; echo beta".to_string()),
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;

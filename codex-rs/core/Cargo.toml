@@ -25,10 +25,12 @@ chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 codex-analytics = { workspace = true }
 codex-agent-graph-store = { workspace = true }
+codex-agent-roles = { workspace = true }
 codex-api = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-apply-patch = { workspace = true }
 codex-async-utils = { workspace = true }
+codex-client = { workspace = true }
 codex-code-mode = { workspace = true }
 codex-connectors = { workspace = true }
 codex-context-fragments = { workspace = true }
@@ -145,17 +147,20 @@ codex-home = { workspace = true }
 codex-otel = { workspace = true }
 codex-test-binary-support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
+codex-utils-redacted-string = { workspace = true }
 codex-web-search-extension = { workspace = true }
 core_test_support = { workspace = true }
 ctor = { workspace = true }
 insta = { workspace = true }
 maplit = { workspace = true }
-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true, features = ["logs"] }
+opentelemetry-appender-tracing = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 test-case = "3.3.1"
 opentelemetry_sdk = { workspace = true, features = [
     "experimental_metrics_custom_reader",
+    "logs",
     "metrics",
 ] }
 serial_test = { workspace = true }

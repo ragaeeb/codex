@@ -5,7 +5,7 @@ use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use serde_json::json;
 
-use crate::render::SkillRenderReport;
+use crate::render_policy::SkillRenderReport;
 
 pub(crate) const SKILLS_WORLD_STATE_ID: &str = "skills";
 pub(crate) const ORCHESTRATOR_SKILLS_WORLD_STATE_ID: &str = "orchestrator_skills";

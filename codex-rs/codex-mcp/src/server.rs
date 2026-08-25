@@ -93,6 +93,7 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool 
 /// those belong to a publication and can change without reconnecting.
 #[derive(Clone)]
 pub(crate) struct McpServerConnectionIdentity {
+    auth: McpServerAuth,
     transport: McpServerTransportConfig,
     environment_id: String,
     oauth_store: Option<(OAuthCredentialsStoreMode, AuthKeyringBackendKind)>,
@@ -140,6 +141,7 @@ impl McpServerConnectionIdentity {
                     bearer_token_env_var: None,
                     http_headers,
                     env_http_headers,
+                    http_headers_helper: _,
                 } if !http_headers.as_ref().is_some_and(|headers| {
                     headers.iter().any(|(name, value)| {
                         name.eq_ignore_ascii_case("authorization") && valid_http_header_value(value)
@@ -189,8 +191,12 @@ impl McpServerConnectionIdentity {
             && matches!(
                 config.transport,
                 McpServerTransportConfig::Stdio { cwd: None, .. }
+                    | McpServerTransportConfig::StreamableHttp {
+                        http_headers_helper: Some(_),
+                        ..
+                    }
             ))
-        .then(|| runtime_context.local_stdio_fallback_cwd());
+        .then(|| runtime_context.local_process_cwd());
         let referenced_environment_variables = referenced_environment_variables(config);
         let runtime_auth = runtime_auth_provider.and(auth).cloned();
         let runtime_auth_token = runtime_auth.as_ref().and_then(|auth| auth.get_token().ok());
@@ -201,6 +207,7 @@ impl McpServerConnectionIdentity {
             .is_some_and(StoredOAuthCredentialSnapshot::store_was_contended);
 
         Self {
+            auth: config.auth.clone(),
             transport: config.transport.clone(),
             environment_id: config.environment_id.clone(),
             oauth_store: stored_oauth_url
@@ -234,7 +241,8 @@ impl McpServerConnectionIdentity {
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         };
-        self.transport == other.transport
+        self.auth == other.auth
+            && self.transport == other.transport
             && self.environment_id == other.environment_id
             && self.oauth_store == other.oauth_store
             && same_resolved_environment(&self.resolved_environment, &other.resolved_environment)
@@ -330,6 +338,7 @@ fn referenced_environment_variables(config: &McpServerConfig) -> Vec<(String, Op
             ..
         } => bearer_token_env_var
             .iter()
+            .filter(|name| config.is_local_environment() || std::env::var_os(name).is_some())
             .chain(env_http_headers.iter().flat_map(|headers| headers.values()))
             .cloned()
             .collect(),
@@ -413,3 +422,7 @@ impl From<&EffectiveMcpServer> for McpServerMetadata {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;

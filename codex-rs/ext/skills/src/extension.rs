@@ -18,6 +18,7 @@ use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_extension_api::PromptFragment;
+use codex_extension_api::SelectedPluginSnapshot;
 use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::SkillInvocationKind;
@@ -48,15 +49,16 @@ use crate::provider::SkillReadRequest;
 use crate::render::AvailableSkillsRender;
 use crate::render::MAX_SKILL_NAME_BYTES;
 use crate::render::MAX_SKILL_PATH_BYTES;
-use crate::render::SkillCatalogRenderPolicy;
-use crate::render::SkillMetadataBudget;
-use crate::render::SkillRenderReport;
 use crate::render::render_available_skills;
-use crate::render::skill_metadata_budget;
 use crate::render::truncate_main_prompt_contents;
 use crate::render::truncate_utf8_to_bytes;
 use crate::render_observability::CatalogSurface;
 use crate::render_observability::record_catalog_render;
+use crate::render_policy::SkillCatalogRenderPolicy;
+use crate::render_policy::SkillMetadataBudget;
+use crate::render_policy::SkillRenderReport;
+use crate::render_policy::catalog_render_policy;
+use crate::render_policy::skill_metadata_budget;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::shadow_selection_experiment::ShadowSelectionExperiment;
 use crate::sources::SkillProviders;
@@ -66,6 +68,7 @@ use crate::state::HostSkillsStepState;
 use crate::state::SkillsSessionState;
 use crate::state::SkillsThreadState;
 use crate::state::SkillsTurnState;
+use crate::telemetry::SkillTelemetry;
 use crate::tools::SkillAnalytics;
 use crate::tools::SkillToolAuthority;
 use crate::tools::skill_tools;
@@ -116,10 +119,17 @@ fn render_prepared_catalog(
             catalog_surface,
             budget,
             &SkillRenderReport::default(),
+            Default::default(),
         );
         return RenderedCatalog::default();
     };
-    record_catalog_render(extension_metrics, catalog_surface, budget, &rendered.report);
+    record_catalog_render(
+        extension_metrics,
+        catalog_surface,
+        budget,
+        &rendered.report,
+        rendered.size,
+    );
     let warning_message = rendered.report.warning_message();
     let fragment = rendered.into_fragment(include_skills_usage_instructions);
     RenderedCatalog {
@@ -227,15 +237,17 @@ where
                 CatalogSurface::ThreadContext,
                 &catalog,
                 include_usage,
-                SkillCatalogRenderPolicy::ExtensionCompatible,
-                skill_metadata_budget(/*context_window*/ None),
+                catalog_render_policy(config.catalog_selection_enabled),
+                skill_metadata_budget(/*context_window*/ None, config.max_context_tokens),
             );
             if let Some(message) = rendered.warning_message {
                 self.emit_warning(thread_store.level_id(), /*turn_id*/ None, message);
             }
             rendered
                 .fragment
-                .map(|fragment| PromptFragment::developer_capability(fragment.render()))
+                .map(|fragment| {
+                    PromptFragment::developer_capability(fragment.render(), fragment.content_kind())
+                })
                 .into_iter()
                 .collect()
         })
@@ -276,6 +288,7 @@ where
             session_store,
             thread_store,
             /*executor_query*/ None,
+            /*selected_plugins*/ None,
             /*sandbox_contexts*/ None,
         )
     }
@@ -310,6 +323,7 @@ where
             session_store,
             thread_store,
             executor_query,
+            step_store.get::<SelectedPluginSnapshot>(),
             step_store.get::<HashMap<String, FileSystemSandboxContext>>(),
         )
     }
@@ -319,6 +333,10 @@ impl<C> SkillInvocationContributor for SkillsExtension<C>
 where
     C: Send + Sync + 'static,
 {
+    fn requires_host_skill_discovery(&self) -> bool {
+        self.providers.has_host_provider()
+    }
+
     fn on_skill_invocation<'a>(
         &'a self,
         input: SkillInvocationInput<'a>,
@@ -395,11 +413,12 @@ where
                 let shadow_selected_entries =
                     collect_explicit_skill_mentions(&input.user_input, &shadow_catalog);
                 Some(self.shadow_selection.run(
-                    &input.user_input,
+                    &input,
                     &shadow_catalog,
                     &shadow_selected_entries,
                     host_snapshot.as_deref(),
                     Arc::clone(&thread_state.recent_skill_invocations),
+                    Arc::clone(&thread_state.shadow_task_context),
                 ))
             } else {
                 None
@@ -420,13 +439,14 @@ where
                 let context_window = model_info
                     .as_deref()
                     .and_then(ModelInfo::resolved_context_window);
-                let metadata_budget = skill_metadata_budget(context_window);
+                let metadata_budget =
+                    skill_metadata_budget(context_window, config.max_context_tokens);
                 let rendered = render_catalog(
                     extension_metrics.as_deref(),
                     CatalogSurface::TurnInput,
                     &turn_catalog,
                     include_usage,
-                    SkillCatalogRenderPolicy::ExtensionCompatible,
+                    catalog_render_policy(config.catalog_selection_enabled),
                     metadata_budget,
                 );
                 if let Some(message) = rendered.warning_message {
@@ -548,23 +568,15 @@ impl<C> SkillsExtension<C> {
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
         executor_query: Option<SkillListQuery>,
+        selected_plugins: Option<Arc<SelectedPluginSnapshot>>,
         sandbox_contexts: Option<Arc<HashMap<String, FileSystemSandboxContext>>>,
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
-        let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
-            return Vec::new();
-        };
-        let orchestrator_available = self.providers.has_orchestrator_provider()
-            && thread_state.orchestrator_skills_enabled();
-        if !orchestrator_available && executor_query.is_none() {
-            return Vec::new();
-        }
-
         skill_tools(
             self.providers.clone(),
             session_store,
             thread_store,
-            orchestrator_available,
             executor_query,
+            selected_plugins,
             sandbox_contexts,
             Arc::clone(&self.shadow_selection),
         )
@@ -667,6 +679,7 @@ pub fn install_with_providers_and_metrics<C>(
         shadow_selection: Arc::new(ShadowSelectionExperiment::new(metrics_client)),
     });
     registry.thread_lifecycle_contributor(extension.clone());
+    registry.turn_lifecycle_contributor(Arc::new(SkillTelemetry));
     registry.config_contributor(extension.clone());
     registry.prompt_contributor(extension.clone());
     registry.turn_input_contributor(extension.clone());

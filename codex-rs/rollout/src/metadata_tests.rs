@@ -8,6 +8,7 @@ use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SessionMeta;
@@ -207,6 +208,7 @@ fn builder_from_items_falls_back_to_filename() {
     let items = vec![RolloutItem::Compacted(CompactedItem {
         message: "noop".to_string(),
         replacement_history: None,
+        mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
@@ -314,7 +316,10 @@ async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_f
         Some(GitInfo {
             commit_hash: Some(codex_git_utils::GitSha::new("rollout-sha")),
             branch: Some("rollout-branch".to_string()),
-            repository_url: Some("git@example.com:openai/codex.git".to_string()),
+            repository_url: Some(
+                SanitizedGitUrl::try_from("git@example.com:openai/codex.git")
+                    .expect("valid git remote URL"),
+            ),
         }),
     );
 

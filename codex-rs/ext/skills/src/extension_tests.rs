@@ -1,6 +1,10 @@
 use std::sync::Mutex;
 
 use codex_extension_api::ExtensionMetrics;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC;
 use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC;
 use codex_otel::THREAD_SKILLS_ENABLED_TOTAL_METRIC;
 use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
@@ -15,6 +19,10 @@ struct RecordingMetrics {
 }
 
 impl ExtensionMetrics for RecordingMetrics {
+    fn counter(&self, name: &str, _inc: i64, _tags: &[(&str, &str)]) {
+        panic!("unexpected counter: {name}");
+    }
+
     fn histogram(&self, name: &str, value: i64, _tags: &[(&str, &str)]) {
         self.samples
             .lock()
@@ -52,6 +60,10 @@ fn empty_catalog_records_zero_metrics_without_a_fragment() {
                 THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC.to_string(),
                 0,
             ),
+            (THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC.to_string(), 0),
+            (THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC.to_string(), 0),
+            (THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC.to_string(), 0),
+            (THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC.to_string(), 0),
         ]
     );
 }

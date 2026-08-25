@@ -16,10 +16,12 @@ mod loader;
 pub mod provider;
 mod render;
 mod render_observability;
+mod render_policy;
 mod selection;
 mod shadow_selection_experiment;
 mod sources;
 mod state;
+mod telemetry;
 mod tools;
 mod warnings;
 mod world_state;
@@ -43,6 +45,7 @@ pub use provider::OrchestratorSkillProvider;
 pub use provider::SkillProvider;
 pub use sources::SkillProviderSource;
 pub use sources::SkillProviders;
+pub use telemetry::record_plugin_turn_usage;
 
 /// Recognizes persisted explicit skill prompts without exposing their fragment implementation.
 pub fn is_skill_prompt_fragment(text: &str) -> bool {

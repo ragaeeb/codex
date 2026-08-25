@@ -59,8 +59,16 @@ impl CodeModeDispatchBroker {
         exec: ExecContext,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
+        argument_repair_disclosure: Arc<
+            Mutex<crate::tools::argument_repair::ArgumentRepairDisclosureAccumulator>,
+        >,
     ) -> CodeModeDispatchWorker {
-        let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker);
+        let tool_runtime = ToolCallRuntime::new_with_argument_repair_disclosure(
+            Arc::clone(&exec.session),
+            step_context,
+            tracker,
+            argument_repair_disclosure,
+        );
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
         let dispatch_rx = self.dispatch_rx.clone();
         let dispatch_gates = Arc::clone(&self.dispatch_gates);

@@ -18,8 +18,11 @@ pub(crate) struct CurrentTimeReminderState {
 }
 
 impl CurrentTimeReminderState {
-    pub(super) fn note_recorded_items(&mut self, items: &[ResponseItem]) {
-        if items.iter().any(|item| {
+    pub(super) fn note_recorded_items<'a>(
+        &mut self,
+        items: impl IntoIterator<Item = &'a ResponseItem>,
+    ) {
+        if items.into_iter().any(|item| {
             is_user_turn_boundary(item)
                 || matches!(
                     item,

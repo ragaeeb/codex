@@ -282,6 +282,8 @@ impl Session {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::SessionMeta(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             }
 
@@ -329,14 +331,14 @@ impl Session {
                 RolloutItem::ResponseItem(response_item) => {
                     history.record_annotated_items(
                         std::slice::from_ref(response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.tool_output_truncation_policy(),
                     );
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
                     let response_item = communication.to_model_input_item();
                     history.record_items(
                         std::iter::once(&response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.tool_output_truncation_policy(),
                     );
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. } => {}
@@ -370,7 +372,9 @@ impl Session {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::SessionMeta(_) => {}
             }
         }
@@ -395,29 +399,22 @@ impl Session {
             match item {
                 RolloutItem::Compacted(_) => world_state_baseline = None,
                 RolloutItem::WorldState(world_state) if world_state.full => {
-                    world_state_baseline = match serde_json::from_value(world_state.state.clone()) {
-                        Ok(snapshot) => Some(snapshot),
-                        Err(err) => {
-                            tracing::warn!(%err, "failed to restore world-state snapshot");
-                            None
-                        }
-                    };
+                    world_state_baseline = Some(WorldStateSnapshot::from(&world_state.state));
                 }
                 RolloutItem::WorldState(world_state) => {
                     let Some(baseline) = world_state_baseline.as_mut() else {
                         tracing::warn!("ignored world-state patch without a full snapshot");
                         continue;
                     };
-                    if let Err(err) = baseline.apply_merge_patch(&world_state.state) {
-                        tracing::warn!(%err, "failed to apply world-state patch");
-                        world_state_baseline = None;
-                    }
+                    baseline.apply_merge_patch(&world_state.state);
                 }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")
                 }

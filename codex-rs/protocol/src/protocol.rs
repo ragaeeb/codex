@@ -16,6 +16,7 @@ use strum_macros::EnumIter;
 
 use crate::AgentPath;
 use crate::ResponseItemId;
+use crate::SanitizedGitUrl;
 use crate::SessionId;
 use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
@@ -31,6 +32,8 @@ use crate::dynamic_tools::DynamicToolCallOutputContentItem;
 use crate::dynamic_tools::DynamicToolCallRequest;
 use crate::dynamic_tools::DynamicToolResponse;
 use crate::dynamic_tools::DynamicToolSpec;
+use crate::error::Result as CodexResult;
+use crate::items::AgentMessageDelivery;
 use crate::items::TurnItem;
 use crate::mcp::CallToolResult;
 use crate::mcp::RequestId;
@@ -54,7 +57,12 @@ use crate::plan_tool::UpdatePlanArgs;
 use crate::request_permissions::RequestPermissionsEvent;
 use crate::request_permissions::RequestPermissionsResponse;
 use crate::request_user_input::RequestUserInputResponse;
-use crate::user_input::UserInput;
+use crate::turn_input::CyberAccessProgram;
+use crate::turn_input::SuspendTurnOutcome;
+use crate::turn_input::TurnInputMode;
+use crate::turn_input::TurnInputRequest;
+use crate::turn_input::TurnInputSubmission;
+use crate::turn_input::TurnStartOptions;
 use codex_extension_items::image_generation::ImageGenerationFailure;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -63,9 +71,11 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as _;
+use serde_json::Map;
 use serde_json::Value;
 use serde_with::serde_as;
 use strum_macros::Display;
+use tokio::sync::oneshot;
 use tracing::error;
 use ts_rs::TS;
 
@@ -85,6 +95,8 @@ pub use crate::approvals::NetworkApprovalContext;
 pub use crate::approvals::NetworkApprovalProtocol;
 pub use crate::approvals::NetworkPolicyAmendment;
 pub use crate::approvals::NetworkPolicyRuleAction;
+pub use crate::environment::EnvironmentConfig;
+pub use crate::environment::EnvironmentConfigState;
 pub use crate::legacy_events::HasLegacyEvent;
 pub use crate::permissions::FileSystemAccessMode;
 pub use crate::permissions::FileSystemPath;
@@ -93,6 +105,7 @@ pub use crate::permissions::FileSystemSandboxKind;
 pub use crate::permissions::FileSystemSandboxPolicy;
 pub use crate::permissions::FileSystemSpecialPath;
 pub use crate::permissions::NetworkSandboxPolicy;
+pub use crate::permissions::RawFileSystemSandboxPolicy;
 use crate::permissions::default_read_only_subpaths_for_writable_root;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
@@ -140,6 +153,7 @@ pub struct TurnEnvironmentSelection {
     pub environment_id: String,
     pub cwd: PathUri,
     pub workspace_roots: Vec<PathUri>,
+    pub config: EnvironmentConfigState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,11 +192,11 @@ pub struct Submission {
     pub id: String,
     /// Payload
     pub op: Op,
-    /// Client-provided id for the user message represented by `Op::UserInput`.
-    pub client_user_message_id: Option<String>,
     /// Optional W3C trace carrier propagated across async submission handoffs.
     pub trace: Option<W3cTraceContext>,
     /// Core-provided ID of the parent turn that directly initiated this submission.
+    ///
+    /// This is only used for inter-agent communication.
     pub parent_turn_id: Option<String>,
     /// Core-provided ID of the top-level turn that causally initiated this submission.
     pub root_turn_id: Option<String>,
@@ -241,6 +255,7 @@ pub struct ConversationStartParams {
 pub enum ConversationStartTransport {
     Websocket,
     Webrtc { sdp: String },
+    ExistingCall { call_id: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -456,8 +471,33 @@ pub struct ConversationSpeechParams {
     pub text: String,
 }
 
-/// Persistent thread-settings overrides that can be applied before user input or
-/// on their own.
+/// Supported sparse changes to one live task's current settings, regardless of
+/// task kind. Child sessions and consumers of frozen initial settings are unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnSettingsUpdate {
+    pub model: Option<String>,
+    /// `None` preserves the selection; `Some(None)` clears it.
+    pub effort: Option<Option<ReasoningEffortConfig>>,
+    pub summary: Option<ReasoningSummaryConfig>,
+    /// `None` preserves the requested tier; `Some(None)` clears it.
+    pub service_tier: Option<Option<String>>,
+}
+
+/// The result of processing a turn-settings update, not merely queueing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnSettingsUpdateOutcome {
+    /// Published for subsequent captures; already captured steps are unchanged.
+    /// The task need not sample or consume every selected preference.
+    Applied,
+    /// The named live task was absent or lost before publication.
+    TargetUnavailable,
+    Rejected {
+        reason: String,
+    },
+}
+
+/// Thread-settings overrides that can be applied before user input or on their
+/// own. Standalone updates change the settings inherited by future turns.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ThreadSettingsOverrides {
     /// Updated fallback `cwd` and environments supplied together as a complete pair.
@@ -557,34 +597,47 @@ pub enum Op {
     /// Request the list of voices supported by realtime conversation streams.
     RealtimeConversationListVoices,
 
-    /// User input, optionally with thread-settings overrides applied first.
-    UserInput {
-        /// User input items, see `InputItem`
-        items: Vec<UserInput>,
-        /// Optional JSON Schema used to constrain the final assistant message for this turn.
-        final_output_json_schema: Option<Value>,
-        /// Optional turn-scoped Responses API `client_metadata`.
-        responsesapi_client_metadata: Option<HashMap<String, String>>,
-        /// Client-supplied context fragments keyed by an opaque source identifier.
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
-
-        /// Persistent thread-settings overrides to apply before the input.
-        thread_settings: ThreadSettingsOverrides,
+    /// Submit turn input using the requested routing behavior.
+    TurnInput {
+        request: Box<TurnInputRequest>,
+        mode: TurnInputMode,
+        reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
     },
 
-    /// Apply persistent thread-settings overrides without starting a turn.
+    /// Resume an interrupted regular turn.
+    RecoverTurn {
+        thread_settings: ThreadSettingsOverrides,
+        start_options: TurnStartOptions,
+        reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
+    },
+
+    /// Stop the active root turn without recording a terminal turn event.
+    SuspendTurnAndShutdown {
+        reply: oneshot::Sender<CodexResult<SuspendTurnOutcome>>,
+    },
+
+    /// Apply thread-settings overrides without starting a turn.
     ///
     /// This uses the same submission queue as turn starts so app-server can
     /// preserve caller order between both kinds of mutation.
     ThreadSettings {
-        /// Persistent thread-settings overrides to apply.
+        /// Sparse thread-settings overrides to apply.
         thread_settings: ThreadSettingsOverrides,
+    },
+
+    /// Update only the named running turn, without changing future settings.
+    /// The reply reports the actual publication or why it did not occur.
+    TurnSettings {
+        turn_id: String,
+        update: TurnSettingsUpdate,
+        reply: oneshot::Sender<TurnSettingsUpdateOutcome>,
     },
 
     /// Inter-agent communication that should be recorded as agent-message history
     /// while still using the normal thread submission lifecycle.
     InterAgentCommunication {
         communication: InterAgentCommunication,
+        start_options: TurnStartOptions,
     },
 
     /// Approve a command execution
@@ -722,18 +775,6 @@ impl FromStr for ThreadHistoryMode {
             "legacy" => Ok(Self::Legacy),
             "paginated" => Ok(Self::Paginated),
             _ => Err(format!("unknown thread history mode `{value}`")),
-        }
-    }
-}
-
-impl From<Vec<UserInput>> for Op {
-    fn from(value: Vec<UserInput>) -> Self {
-        Op::UserInput {
-            items: value,
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides::default(),
         }
     }
 }
@@ -876,8 +917,11 @@ impl Op {
             Self::RealtimeConversationSpeech(_) => "realtime_conversation_speech",
             Self::RealtimeConversationClose => "realtime_conversation_close",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
-            Self::UserInput { .. } => "user_input",
+            Self::TurnInput { .. } => "turn_input",
+            Self::RecoverTurn { .. } => "recover_turn",
+            Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
             Self::ThreadSettings { .. } => "thread_settings",
+            Self::TurnSettings { .. } => "turn_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",
             Self::PatchApproval { .. } => "patch_approval",
@@ -917,9 +961,8 @@ impl Op {
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
 pub enum AskForApproval {
-    /// Under this policy, only "known safe" commands—as determined by
-    /// `is_safe_command()`—that **only read files** are auto‑approved.
-    /// Everything else will ask the user to approve.
+    /// Internal policy for projects marked untrusted. Commands require
+    /// approval unless an explicit exec policy rule allows them.
     #[serde(rename = "untrusted")]
     #[strum(serialize = "untrusted")]
     UnlessTrusted,
@@ -1119,7 +1162,9 @@ impl FromStr for FileSystemSandboxPolicy {
     type Err = serde_json::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(s)
+        serde_json::from_str::<RawFileSystemSandboxPolicy>(s)?
+            .try_into()
+            .map_err(serde_json::Error::custom)
     }
 }
 
@@ -1513,12 +1558,14 @@ pub enum HookEventName {
     SubagentStart,
     SubagentStop,
     Stop,
+    Interrupt,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum HookHandlerType {
     Command,
+    McpTool,
     Prompt,
     Agent,
 }
@@ -1775,6 +1822,7 @@ pub enum CodexErrorInfo {
     UsageLimitExceeded,
     ServerOverloaded,
     CyberPolicy,
+    MisalignmentPolicyViolation,
     HttpConnectionFailed {
         http_status_code: Option<u16>,
     },
@@ -1813,6 +1861,7 @@ impl CodexErrorInfo {
             | Self::UsageLimitExceeded
             | Self::ServerOverloaded
             | Self::CyberPolicy
+            | Self::MisalignmentPolicyViolation
             | Self::HttpConnectionFailed { .. }
             | Self::ResponseStreamConnectionFailed { .. }
             | Self::InternalServerError
@@ -2335,6 +2384,9 @@ pub struct AgentMessageEvent {
     pub phase: Option<MessagePhase>,
     #[serde(default)]
     pub memory_citation: Option<MemoryCitation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub delivery: Option<AgentMessageDelivery>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -2592,6 +2644,7 @@ pub enum SessionSource {
 pub enum ThreadSource {
     User,
     Subagent,
+    GuardianReview,
     Feature(String),
     MemoryConsolidation,
 }
@@ -2601,6 +2654,7 @@ impl ThreadSource {
         match self {
             ThreadSource::User => "user",
             ThreadSource::Subagent => "subagent",
+            ThreadSource::GuardianReview => "guardian_review",
             ThreadSource::Feature(feature) => feature,
             ThreadSource::MemoryConsolidation => "memory_consolidation",
         }
@@ -2634,6 +2688,7 @@ impl FromStr for ThreadSource {
         match value {
             "user" => Ok(ThreadSource::User),
             "subagent" => Ok(ThreadSource::Subagent),
+            "guardian_review" => Ok(ThreadSource::GuardianReview),
             "memory_consolidation" => Ok(ThreadSource::MemoryConsolidation),
             other => Ok(ThreadSource::Feature(other.to_string())),
         }
@@ -2645,6 +2700,7 @@ impl FromStr for ThreadSource {
 #[ts(rename_all = "snake_case")]
 pub enum InternalSessionSource {
     MemoryConsolidation,
+    Guardian,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -2817,6 +2873,7 @@ impl fmt::Display for InternalSessionSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InternalSessionSource::MemoryConsolidation => f.write_str("memory_consolidation"),
+            InternalSessionSource::Guardian => f.write_str("guardian"),
         }
     }
 }
@@ -2996,15 +3053,15 @@ impl<'de> Deserialize<'de> for SessionMetaLine {
 pub struct WorldStateItem {
     /// Full snapshots establish a new baseline; patches update the current baseline.
     pub full: bool,
-    pub state: Value,
+    pub state: Map<String, Value>,
 }
 
 impl WorldStateItem {
-    pub fn full(state: Value) -> Self {
+    pub fn full(state: Map<String, Value>) -> Self {
         Self { full: true, state }
     }
 
-    pub fn patch(state: Value) -> Self {
+    pub fn patch(state: Map<String, Value>) -> Self {
         Self { full: false, state }
     }
 }
@@ -3038,10 +3095,14 @@ pub struct TurnContextItem {
     pub sandbox_policy: SandboxPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<PermissionProfile>,
+    /// Built-in or named profile that produced `permission_profile`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub active_permission_profile: Option<ActivePermissionProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<TurnContextNetworkItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_system_sandbox_policy: Option<FileSystemSandboxPolicy>,
+    pub file_system_sandbox_policy: Option<RawFileSystemSandboxPolicy>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comp_hash: Option<String>,
@@ -3056,6 +3117,8 @@ pub struct TurnContextItem {
     pub multi_agent_mode: Option<MultiAgentMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realtime_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cyber_access_program: Option<CyberAccessProgram>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffortConfig>,
     // Compatibility-only field written with a default value so older Codex
@@ -3068,8 +3131,13 @@ pub struct TurnContextItem {
 impl TurnContextItem {
     pub fn permission_profile(&self) -> PermissionProfile {
         self.permission_profile.clone().unwrap_or_else(|| {
-            let file_system_sandbox_policy =
-                self.file_system_sandbox_policy.clone().unwrap_or_else(|| {
+            let file_system_sandbox_policy = self
+                .file_system_sandbox_policy
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()
+                .unwrap_or_else(|_| Some(FileSystemSandboxPolicy::restricted(Vec::new())))
+                .unwrap_or_else(|| {
                     FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                         &self.sandbox_policy,
                         self.cwd.as_path(),
@@ -3145,8 +3213,13 @@ pub struct GitInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Repository URL (if available from remote)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repository_url: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::sanitized_git_url::deserialize_optional_sanitized_git_url",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub repository_url: Option<SanitizedGitUrl>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3844,7 +3917,7 @@ pub struct ThreadGoalUpdatedEvent {
     pub goal: ThreadGoal,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "protocol/")]
 pub struct ThreadQueueChangedEvent {
@@ -4091,6 +4164,7 @@ pub enum SubAgentActivityKind {
     Started,
     Interacted,
     Interrupted,
+    Completed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -4731,7 +4805,7 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: blocked },
+                path: blocked.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -4791,7 +4865,7 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: secret },
+                path: secret.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -4855,12 +4929,12 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: docs },
+                path: docs.into(),
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: docs_public },
+                path: docs_public.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
@@ -4896,7 +4970,7 @@ mod tests {
         };
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: external_write_path,
+                path: external_write_path.into(),
             },
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
@@ -5567,7 +5641,7 @@ mod tests {
 
     #[test]
     fn user_input_text_serializes_empty_text_elements() -> Result<()> {
-        let input = UserInput::Text {
+        let input = crate::user_input::UserInput::Text {
             text: "hello".to_string(),
             text_elements: Vec::new(),
         };
@@ -5777,19 +5851,22 @@ mod tests {
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             permission_profile: None,
+            active_permission_profile: None,
             network: Some(TurnContextNetworkItem {
                 allowed_domains: vec!["api.example.com".to_string()],
                 denied_domains: vec!["blocked.example.com".to_string()],
             }),
-            file_system_sandbox_policy: Some(FileSystemSandboxPolicy::restricted(vec![
-                FileSystemSandboxEntry {
+            file_system_sandbox_policy: Some(
+                FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
                     path: FileSystemPath::GlobPattern {
                         pattern: "/tmp/private/**/*.txt".to_string(),
                     },
                     access: FileSystemAccessMode::Deny,
                     missing_path_behavior: None,
-                },
-            ])),
+                }])
+                .try_into()
+                .expect("serializable split policy"),
+            ),
             model: "gpt-5".to_string(),
             comp_hash: None,
             personality: None,
@@ -5797,6 +5874,7 @@ mod tests {
             multi_agent_version: None,
             multi_agent_mode: None,
             realtime_active: None,
+            cyber_access_program: None,
             effort: None,
             summary: ReasoningSummaryConfig::Auto,
         };

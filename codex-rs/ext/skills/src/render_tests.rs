@@ -1,4 +1,6 @@
 use super::*;
+use std::num::NonZeroUsize;
+
 use crate::HostSkillsSnapshot;
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillPackageId;
@@ -6,16 +8,20 @@ use crate::catalog::SkillResourceId;
 use crate::provider::HostSkillProvider;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillProvider;
+use crate::render_policy::SKILL_DESCRIPTION_TRUNCATED_WARNING;
+use crate::render_policy::skill_metadata_budget;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_string::approx_token_count;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::Semaphore;
 
+use crate::catalog_prompt::available_skills_body_bytes;
 use crate::catalog_prompt::render_available_skills_body;
 use crate::loader::HostSkillRoot;
 use crate::loader::load_and_merge_host_skill_roots;
@@ -192,18 +198,258 @@ fn description_selection_follows_render_policy() {
 }
 
 #[test]
+fn stable_compact_policy_is_sorted_and_keeps_routing_descriptions() {
+    let catalog = SkillCatalog {
+        entries: vec![
+            entry(
+                "zeta",
+                "long zeta description",
+                /*short_description*/ None,
+            )
+            .with_prompt_scope(SkillScope::Repo),
+            entry("alpha", "long alpha description", Some("short alpha"))
+                .with_prompt_scope(SkillScope::System),
+        ],
+        warnings: Vec::new(),
+    };
+
+    let rendered = render_available_skills(
+        &catalog,
+        SkillCatalogRenderPolicy::StableCompact,
+        SkillMetadataBudget::Characters(8_000),
+        /*include_skills_usage_instructions*/ false,
+    )
+    .expect("catalog should render");
+    let fragment = rendered
+        .into_fragment(/*include_skills_usage_instructions*/ false)
+        .expect("catalog fragment should render");
+
+    assert_eq!(
+        fragment.body(),
+        render_available_skills_body(
+            SkillPromptKind::Unaliased,
+            &[],
+            &[
+                "- alpha: short alpha (file: /skills/alpha/SKILL.md)".to_string(),
+                "- zeta: long zeta description (file: /skills/zeta/SKILL.md)".to_string(),
+            ],
+        )
+    );
+}
+
+#[test]
+fn disabled_catalog_selection_is_byte_identical_to_legacy_rendering() {
+    let catalog = SkillCatalog {
+        entries: vec![entry(
+            "alpha",
+            "full description",
+            Some("short description"),
+        )],
+        warnings: Vec::new(),
+    };
+    let render = |policy| {
+        render_available_skills(
+            &catalog,
+            policy,
+            SkillMetadataBudget::Characters(8_000),
+            /*include_skills_usage_instructions*/ true,
+        )
+        .expect("catalog should render")
+    };
+    let legacy = render(SkillCatalogRenderPolicy::ExtensionCompatible);
+    let disabled = render(catalog_render_policy(/*stable_compact*/ false));
+
+    assert_eq!(disabled.report, legacy.report);
+    assert_eq!(disabled.size, legacy.size);
+    assert_eq!(
+        disabled
+            .into_fragment(/*include_skills_usage_instructions*/ true)
+            .expect("disabled fragment should render")
+            .body(),
+        legacy
+            .into_fragment(/*include_skills_usage_instructions*/ true)
+            .expect("legacy fragment should render")
+            .body(),
+    );
+}
+
+#[test]
+fn stable_compact_falls_back_to_legacy_when_names_and_locators_do_not_fit() {
+    let catalog = SkillCatalog {
+        entries: vec![
+            entry("alpha", "alpha description", Some("alpha")),
+            entry("beta", "beta description", Some("beta")),
+        ],
+        warnings: Vec::new(),
+    };
+    let budget = SkillMetadataBudget::Characters(60);
+    let legacy = render_available_skills(
+        &catalog,
+        SkillCatalogRenderPolicy::ExtensionCompatible,
+        budget,
+        /*include_skills_usage_instructions*/ false,
+    )
+    .expect("legacy catalog should render");
+    let compact = render_available_skills(
+        &catalog,
+        SkillCatalogRenderPolicy::StableCompact,
+        budget,
+        /*include_skills_usage_instructions*/ false,
+    )
+    .expect("compact catalog should fall back");
+
+    assert!(legacy.report.omitted_count > 0);
+    assert_eq!(compact.report, legacy.report);
+    assert_eq!(
+        compact.size,
+        legacy
+            .size
+            .with_outcome(SkillCatalogRenderOutcome::Fallback)
+    );
+    assert_eq!(
+        compact
+            .into_fragment(/*include_skills_usage_instructions*/ false)
+            .map(|fragment| fragment.body()),
+        legacy
+            .into_fragment(/*include_skills_usage_instructions*/ false)
+            .map(|fragment| fragment.body()),
+    );
+}
+
+#[test]
+fn stable_compact_combined_catalog_falls_back_to_legacy() {
+    let executor_catalog = SkillCatalog {
+        entries: vec![SkillCatalogEntry::new(
+            SkillPackageId("executor/alpha".to_string()),
+            SkillAuthority::new(SkillSourceKind::Executor, "env-1"),
+            "alpha",
+            "alpha description",
+            SkillResourceId::new("skill://executor/alpha/SKILL.md"),
+        )],
+        warnings: Vec::new(),
+    };
+    let host_catalog = SkillCatalog {
+        entries: vec![entry("beta", "beta description", Some("beta"))],
+        warnings: Vec::new(),
+    };
+    let budget = SkillMetadataBudget::Characters(70);
+    let legacy = render_combined_available_skills(
+        &executor_catalog,
+        &SkillCatalog::default(),
+        &host_catalog,
+        budget,
+        /*include_skills_usage_instructions*/ false,
+        /*stable_compact*/ false,
+    );
+    let compact = render_combined_available_skills(
+        &executor_catalog,
+        &SkillCatalog::default(),
+        &host_catalog,
+        budget,
+        /*include_skills_usage_instructions*/ false,
+        /*stable_compact*/ true,
+    );
+
+    for (compact, legacy) in [
+        (compact.executor, legacy.executor),
+        (compact.orchestrator, legacy.orchestrator),
+        (compact.host, legacy.host),
+    ] {
+        let compact = compact.expect("combined compact group should render");
+        let legacy = legacy.expect("combined legacy group should render");
+        assert_eq!(compact.report, legacy.report);
+        assert_eq!(
+            compact.size,
+            legacy
+                .size
+                .with_outcome(SkillCatalogRenderOutcome::Fallback)
+        );
+        assert_eq!(compact.skill_root_lines, legacy.skill_root_lines);
+        assert_eq!(compact.skill_lines, legacy.skill_lines);
+    }
+}
+
+#[test]
+fn rendered_catalog_size_matches_the_fragment_body() {
+    let catalog = SkillCatalog {
+        entries: vec![entry("sized", "description", Some("short"))],
+        warnings: Vec::new(),
+    };
+    let rendered = render_available_skills(
+        &catalog,
+        SkillCatalogRenderPolicy::ExtensionCompatible,
+        SkillMetadataBudget::Characters(8_000),
+        /*include_skills_usage_instructions*/ true,
+    )
+    .expect("catalog should render");
+    let size = rendered.size;
+    let fragment = rendered
+        .into_fragment(/*include_skills_usage_instructions*/ true)
+        .expect("catalog fragment should render");
+
+    assert_eq!(size.rendered_body_bytes, fragment.body().len());
+    assert!(size.full_body_bytes >= size.rendered_body_bytes);
+    assert!(size.full_body_tokens >= size.rendered_body_tokens);
+}
+
+#[test]
+fn catalog_body_byte_accounting_matches_rendered_fragments() {
+    for (prompt_kind, roots, skills, include_usage) in [
+        (
+            SkillPromptKind::Unaliased,
+            Vec::new(),
+            vec!["- demo: résumé (file: /skills/demo/SKILL.md)".to_string()],
+            false,
+        ),
+        (
+            SkillPromptKind::HostAliases,
+            vec!["- `r0` = `/Users/test/.codex/skills`".to_string()],
+            vec!["- demo: short (file: r0/demo/SKILL.md)".to_string()],
+            true,
+        ),
+        (
+            SkillPromptKind::ResourceAliases,
+            vec!["- `e0` = `skill://executor/root`".to_string()],
+            vec!["- demo: short (executor package: e0/demo)".to_string()],
+            true,
+        ),
+    ] {
+        let fragment = AvailableSkillsInstructions::from_skill_lines(
+            prompt_kind,
+            roots.clone(),
+            skills.clone(),
+            include_usage,
+        );
+        assert_eq!(
+            available_skills_body_bytes(prompt_kind, &roots, &skills, include_usage),
+            fragment.body().len(),
+        );
+    }
+}
+
+#[test]
 fn catalog_budget_uses_context_percentage_or_character_fallback() {
     assert_eq!(
-        skill_metadata_budget(Some(100_000)),
+        skill_metadata_budget(Some(100_000), /*max_context_tokens*/ None),
         SkillMetadataBudget::Tokens(2_000)
     );
     assert_eq!(
-        skill_metadata_budget(Some(400_000)),
+        skill_metadata_budget(Some(400_000), /*max_context_tokens*/ None),
         SkillMetadataBudget::Tokens(8_000)
     );
     assert_eq!(
-        skill_metadata_budget(/*context_window*/ None),
+        skill_metadata_budget(
+            /*context_window*/ None, /*max_context_tokens*/ None
+        ),
         SkillMetadataBudget::Characters(8_000)
+    );
+    assert_eq!(
+        skill_metadata_budget(Some(100_000), NonZeroUsize::new(5_000)),
+        SkillMetadataBudget::Tokens(5_000)
+    );
+    assert_eq!(
+        skill_metadata_budget(/*context_window*/ None, NonZeroUsize::new(50_000)),
+        SkillMetadataBudget::Tokens(10_000)
     );
 }
 
@@ -246,7 +492,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
     - Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
     - Missing/blocked: If a named skill isn't in the list or its source can't be read, say so briefly and continue with the best fallback.
     - How to use a skill (progressive disclosure):
-      1) After deciding to use a skill, the main agent must read its `SKILL.md` completely before taking task actions. For a `file` entry, open the listed path. For an `executor package` or `orchestrator package`, expand its root alias when present and call `skills.read` with the complete locator as `package`; omit `resource` to read `SKILL.md` directly without calling `skills.list`. If a read is paginated, follow `next_cursor` until EOF.
+      1) After deciding to use a skill, the main agent must read its `SKILL.md` completely before taking task actions. For a `file` entry, open the listed path. For an `executor package` or `orchestrator package`, pass the listed locator directly to `skills.read` as `package`; root aliases are resolved automatically. Omit `resource` to read `SKILL.md` directly without calling `skills.list`. If a read is paginated, follow `next_cursor` until EOF.
       2) When `SKILL.md` references another resource, use the same access mechanism. For executor and orchestrator skills, pass the complete package-contained resource identifier with the same package to `skills.read`; do not treat `skill://` identifiers as filesystem paths.
       3) If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the resources required for the task. The main agent must read each required instruction or reference file itself before acting on it. Do not delegate reading, summarizing, or interpreting skill instructions to a subagent. Subagents may still perform task work when the selected skill allows it.
       4) For filesystem-backed skills, prefer running or patching provided scripts instead of retyping large code blocks. For executor and orchestrator skills, use `skills.read` and the available tools; do not invent a local path.
@@ -564,6 +810,7 @@ fn mixed_catalog_reserves_executor_omission_marker_by_omitting_host_first() {
         &host_catalog,
         SkillMetadataBudget::Tokens(28),
         /*include_skills_usage_instructions*/ false,
+        /*stable_compact*/ false,
     );
     let host = host.expect("host catalog should render");
     let executor = executor.expect("executor catalog should render");
@@ -652,6 +899,7 @@ fn mixed_catalogs_alias_all_skill_sources_under_budget_pressure() {
         &host_catalog,
         SkillMetadataBudget::Characters(900),
         /*include_skills_usage_instructions*/ true,
+        /*stable_compact*/ false,
     );
     let executor = rendered.executor.expect("executor catalog should render");
     let orchestrator = rendered
@@ -754,6 +1002,7 @@ fn mixed_catalog_prefers_executor_inclusion_over_total_aliased_inclusion() {
         &host_catalog,
         SkillMetadataBudget::Tokens(74),
         /*include_skills_usage_instructions*/ false,
+        /*stable_compact*/ false,
     );
     let host = host.expect("host catalog should render");
     let executor = executor.expect("executor catalog should render");

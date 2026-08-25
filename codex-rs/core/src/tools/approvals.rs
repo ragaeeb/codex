@@ -1,25 +1,28 @@
 //! Central approval policy-stage execution and reviewer routing.
 
 use crate::command_canonicalization::canonicalize_command_for_approval;
+use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::guardian::GuardianReviewContext;
+use crate::guardian::GuardianReviewOptions;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
+use crate::guardian::review_approval_request_with_cancel;
 use crate::guardian::routes_approval_policy_to_guardian;
+use crate::guardian::spawn_approval_request_review;
 use crate::hook_runtime::run_permission_request_hooks;
 use crate::mcp_tool_call::request_mcp_tool_user_approval;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::tools::flat_tool_name;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::runtimes::apply_patch::ApplyPatchApprovalKey;
-use crate::tools::runtimes::shell::ApprovalKey;
 use crate::tools::runtimes::unified_exec::UnifiedExecApprovalKey;
 use crate::tools::sandboxing::ApprovalRequestReasons;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::with_cached_approval;
+use codex_analytics::GuardianApprovalRequestSource;
 use codex_config::types::AppToolApproval;
 use codex_hooks::PermissionRequestDecision;
 use codex_otel::ToolDecisionSource;
@@ -27,24 +30,30 @@ use codex_protocol::approvals::ExecPolicyAmendment;
 #[cfg(unix)]
 use codex_protocol::approvals::GuardianCommandSource;
 use codex_protocol::approvals::NetworkApprovalContext;
+use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
+use tracing::warn;
 
 #[derive(Clone)]
 pub(crate) struct ApprovalContext {
     pub(crate) review_context: GuardianReviewContext,
+    pub(crate) cancellation_token: Option<CancellationToken>,
     pub(crate) call_id: String,
     pub(crate) tool_name: ToolName,
     pub(crate) strict_auto_review: bool,
@@ -55,17 +64,6 @@ pub(crate) struct ApprovalContext {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ApprovalAction {
-    Shell {
-        id: String,
-        environment_id: String,
-        command: Vec<String>,
-        hook_command: String,
-        cwd: PathUri,
-        sandbox_permissions: SandboxPermissions,
-        additional_permissions: Option<AdditionalPermissionProfile>,
-        justification: Option<String>,
-        proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
-    },
     ExecCommand {
         id: String,
         environment_id: String,
@@ -118,12 +116,31 @@ pub(crate) enum ApprovalAction {
         allow_session_remember: bool,
         allow_persistent_approval: bool,
     },
+    NetworkAccess {
+        id: String,
+        turn_id: String,
+        environment_id: String,
+        target: String,
+        host: String,
+        protocol: NetworkApprovalProtocol,
+        port: u16,
+        trigger: Option<GuardianNetworkAccessTrigger>,
+        hook_command: String,
+        hook_run_id: String,
+        command: Vec<String>,
+        cwd: AbsolutePathBuf,
+    },
+    RequestPermissions {
+        id: String,
+        turn_id: String,
+        reason: Option<String>,
+        permissions: RequestPermissionProfile,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub(crate) enum ApprovalCacheKey {
-    Shell(ApprovalKey),
     ExecCommand(UnifiedExecApprovalKey),
     ApplyPatch(ApplyPatchApprovalKey),
 }
@@ -131,12 +148,7 @@ pub(crate) enum ApprovalCacheKey {
 impl ApprovalAction {
     pub(crate) fn permission_request_payload(&self) -> PermissionRequestPayload {
         match self {
-            Self::Shell {
-                hook_command,
-                justification,
-                ..
-            }
-            | Self::ExecCommand {
+            Self::ExecCommand {
                 hook_command,
                 justification,
                 ..
@@ -160,25 +172,30 @@ impl ApprovalAction {
                     .clone()
                     .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
             },
+            Self::NetworkAccess {
+                hook_command,
+                target,
+                ..
+            } => PermissionRequestPayload::bash(
+                hook_command.clone(),
+                Some(format!("network-access {target}")),
+            ),
+            Self::RequestPermissions {
+                reason,
+                permissions,
+                ..
+            } => PermissionRequestPayload {
+                tool_name: HookToolName::new("request_permissions"),
+                tool_input: serde_json::json!({
+                    "reason": reason,
+                    "permissions": permissions,
+                }),
+            },
         }
     }
 
     pub(crate) fn cache_keys(&self) -> Vec<ApprovalCacheKey> {
         match self {
-            Self::Shell {
-                environment_id,
-                command,
-                cwd,
-                sandbox_permissions,
-                additional_permissions,
-                ..
-            } => vec![ApprovalCacheKey::Shell(ApprovalKey {
-                environment_id: environment_id.clone(),
-                command: canonicalize_command_for_approval(command),
-                cwd: cwd.clone(),
-                sandbox_permissions: *sandbox_permissions,
-                additional_permissions: additional_permissions.clone(),
-            })],
             Self::ExecCommand {
                 environment_id,
                 command,
@@ -189,6 +206,7 @@ impl ApprovalAction {
                 ..
             } => vec![ApprovalCacheKey::ExecCommand(UnifiedExecApprovalKey {
                 environment_id: environment_id.clone(),
+                executable: command.first().cloned(),
                 command: canonicalize_command_for_approval(command),
                 cwd: cwd.clone(),
                 tty: *tty,
@@ -197,7 +215,9 @@ impl ApprovalAction {
             })],
             #[cfg(unix)]
             Self::Execve { .. } => Vec::new(),
-            Self::McpToolCall { .. } => Vec::new(),
+            Self::McpToolCall { .. }
+            | Self::NetworkAccess { .. }
+            | Self::RequestPermissions { .. } => Vec::new(),
             Self::ApplyPatch {
                 environment_id,
                 files,
@@ -217,23 +237,6 @@ impl ApprovalAction {
 
     fn into_guardian_request(self) -> std::io::Result<crate::guardian::GuardianApprovalRequest> {
         Ok(match self {
-            Self::Shell {
-                id,
-                environment_id,
-                command,
-                cwd,
-                sandbox_permissions,
-                additional_permissions,
-                justification,
-                ..
-            } => crate::guardian::GuardianApprovalRequest::Shell {
-                id,
-                command,
-                cwd: guardian_cwd(&environment_id, cwd)?,
-                sandbox_permissions,
-                additional_permissions,
-                justification,
-            },
             Self::ExecCommand {
                 id,
                 environment_id,
@@ -312,6 +315,35 @@ impl ApprovalAction {
                 tool_description,
                 annotations,
             },
+            Self::NetworkAccess {
+                id,
+                turn_id,
+                target,
+                host,
+                protocol,
+                port,
+                trigger,
+                ..
+            } => crate::guardian::GuardianApprovalRequest::NetworkAccess {
+                id,
+                turn_id,
+                target,
+                host,
+                protocol,
+                port,
+                trigger,
+            },
+            Self::RequestPermissions {
+                id,
+                turn_id,
+                reason,
+                permissions,
+            } => crate::guardian::GuardianApprovalRequest::RequestPermissions {
+                id,
+                turn_id,
+                reason,
+                permissions,
+            },
         })
     }
 }
@@ -372,7 +404,7 @@ struct ApprovalResolution {
 }
 
 impl ApprovalResolution {
-    fn into_tool_result(self) -> Result<ReviewDecision, ToolError> {
+    fn into_tool_result(self, model_info: &ModelInfo) -> Result<ReviewDecision, ToolError> {
         let source = self.source;
         match self.decision {
             ReviewDecision::ApprovedMcpPolicyAmendment => {
@@ -394,7 +426,9 @@ impl ApprovalResolution {
                 Err(ToolError::Rejected(rejection.to_string()))
             }
             ReviewDecision::Denied { rejection } => Err(ToolError::Rejected(rejection)),
-            ReviewDecision::TimedOut => Err(ToolError::Rejected(guardian_timeout_message())),
+            ReviewDecision::TimedOut => {
+                Err(ToolError::Rejected(guardian_timeout_message(model_info)))
+            }
             ReviewDecision::Abort => Err(ToolError::Codex(CodexErr::TurnAborted)),
             decision => Ok(decision),
         }
@@ -408,9 +442,11 @@ impl Session {
         ctx: ApprovalContext,
     ) -> Result<ReviewDecision, ToolError> {
         let is_mcp_tool_call = matches!(&action, ApprovalAction::McpToolCall { .. });
+        let is_network_approval = matches!(&action, ApprovalAction::NetworkAccess { .. });
         let permission_request_run_id = match &action {
             #[cfg(unix)]
             ApprovalAction::Execve { approval_id, .. } => approval_id.clone(),
+            ApprovalAction::NetworkAccess { hook_run_id, .. } => hook_run_id.clone(),
             _ if ctx.retry_reason.is_some() => format!("{}:retry", ctx.call_id),
             _ => ctx.call_id.clone(),
         };
@@ -436,11 +472,32 @@ impl Session {
             },
             None => self.request_reviewer_approval(action, &ctx).await,
         };
-        record_resolution(&ctx, &resolution);
+        // Network approvals record their final telemetry after validation and persistence.
+        if !is_network_approval {
+            record_resolution(&ctx, &resolution);
+        }
         if is_mcp_tool_call && resolution.decision == ReviewDecision::ApprovedMcpPolicyAmendment {
             return Ok(resolution.decision);
         }
-        resolution.into_tool_result()
+        if is_network_approval {
+            match (&resolution.decision, resolution.source) {
+                (
+                    ReviewDecision::NetworkPolicyAmendment {
+                        network_policy_amendment,
+                    },
+                    _,
+                ) if network_policy_amendment.action == NetworkPolicyRuleAction::Deny => {
+                    return Ok(resolution.decision);
+                }
+                (ReviewDecision::Abort, ApprovalResolutionSource::Guardian) => {
+                    return Err(ToolError::Rejected(
+                        "automatic approval review was cancelled".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        resolution.into_tool_result(ctx.review_context.turn().model_info())
     }
 
     async fn request_reviewer_approval(
@@ -472,11 +529,12 @@ impl Session {
         ApprovalResolution { decision, source }
     }
 
-    async fn request_guardian_approval(
+    pub(crate) async fn request_guardian_approval(
         self: &Arc<Self>,
         action: ApprovalAction,
         ctx: &ApprovalContext,
     ) -> ReviewDecision {
+        let is_network_approval = matches!(&action, ApprovalAction::NetworkAccess { .. });
         let review_id = new_guardian_review_id();
         let action = match action.into_guardian_request() {
             Ok(action) => action,
@@ -488,17 +546,65 @@ impl Session {
             }
         };
 
-        review_approval_request(
-            self,
-            ctx.review_context.clone(),
-            review_id,
-            action,
-            ApprovalRequestReasons {
-                approval: ctx.approval_reason.clone(),
-                retry: ctx.retry_reason.clone(),
-            },
-        )
-        .await
+        if let Some(cancellation_token) = &ctx.cancellation_token {
+            let review = spawn_approval_request_review(
+                Arc::clone(self),
+                ctx.review_context.clone(),
+                review_id,
+                action,
+                ApprovalRequestReasons {
+                    approval: ctx.approval_reason.clone(),
+                    retry: ctx.retry_reason.clone(),
+                },
+                GuardianReviewOptions {
+                    plugin_attribution_override: None,
+                    approval_request_source: GuardianApprovalRequestSource::MainTurn,
+                    external_cancel: Some(cancellation_token.clone()),
+                },
+            );
+            review.await.unwrap_or_else(|_| {
+                ReviewDecision::denied("automatic approval review could not complete")
+            })
+        } else if is_network_approval {
+            let review_cancel = CancellationToken::new();
+            let review_cancel_guard = review_cancel.clone().drop_guard();
+            let review_session = Arc::clone(self);
+            let review_context = ctx.review_context.clone();
+            let retry_reason = ctx.retry_reason.clone();
+            let review = tokio::spawn(async move {
+                review_approval_request_with_cancel(
+                    &review_session,
+                    review_context,
+                    review_id,
+                    action,
+                    retry_reason,
+                    GuardianReviewOptions {
+                        plugin_attribution_override: None,
+                        approval_request_source: GuardianApprovalRequestSource::MainTurn,
+                        external_cancel: Some(review_cancel),
+                    },
+                )
+                .await
+            });
+            let decision = review.await.unwrap_or_else(|err| {
+                warn!("network Guardian review task failed: {err}");
+                ReviewDecision::denied("automatic approval review could not complete")
+            });
+            drop(review_cancel_guard.disarm());
+            decision
+        } else {
+            review_approval_request(
+                self,
+                ctx.review_context.clone(),
+                review_id,
+                action,
+                ApprovalRequestReasons {
+                    approval: ctx.approval_reason.clone(),
+                    retry: ctx.retry_reason.clone(),
+                },
+            )
+            .await
+        }
     }
 
     async fn request_user_approval(
@@ -507,16 +613,7 @@ impl Session {
         ctx: &ApprovalContext,
     ) -> ReviewDecision {
         match action {
-            ApprovalAction::Shell {
-                environment_id,
-                command,
-                cwd,
-                additional_permissions,
-                justification,
-                proposed_execpolicy_amendment,
-                ..
-            }
-            | ApprovalAction::ExecCommand {
+            ApprovalAction::ExecCommand {
                 environment_id,
                 command,
                 cwd,
@@ -534,20 +631,25 @@ impl Session {
                         ));
                     }
                 };
-                let tool_name = match action {
-                    ApprovalAction::Shell { .. } => "shell",
-                    ApprovalAction::ExecCommand { .. } => "unified_exec",
-                    #[cfg(unix)]
-                    ApprovalAction::Execve { .. } => unreachable!("matched command approval"),
-                    ApprovalAction::ApplyPatch { .. } => unreachable!("matched command approval"),
-                    ApprovalAction::McpToolCall { .. } => unreachable!("matched command approval"),
-                };
+                let tool_name = "unified_exec";
                 let reason = ctx
                     .retry_reason
                     .clone()
                     .or_else(|| ctx.approval_reason.clone())
                     .or_else(|| justification.clone());
-                with_cached_approval(&self.services, tool_name, action.cache_keys(), || async {
+                let policy_fingerprint = ctx
+                    .review_context
+                    .environments()
+                    .turn_environments()
+                    .find(|environment| environment.selection.environment_id == *environment_id)
+                    .and_then(|environment| environment.config().exec_policy.as_ref())
+                    .map(codex_execpolicy::RequirementsExecPolicy::fingerprint);
+                let cache_keys = action
+                    .cache_keys()
+                    .into_iter()
+                    .map(|key| (key, &policy_fingerprint))
+                    .collect();
+                with_cached_approval(&self.services, tool_name, cache_keys, || async {
                     self.request_command_approval(
                         ctx.review_context.turn(),
                         ctx.call_id.clone(),
@@ -640,6 +742,31 @@ impl Session {
                 )
                 .await
             }
+            ApprovalAction::NetworkAccess {
+                environment_id,
+                command,
+                cwd,
+                ..
+            } => {
+                self.request_command_approval(
+                    ctx.review_context.turn(),
+                    ctx.call_id.clone(),
+                    /*approval_id*/ None,
+                    Some(environment_id.clone()),
+                    command.clone(),
+                    cwd.clone(),
+                    ctx.approval_reason.clone(),
+                    ctx.network_approval_context.clone(),
+                    /*proposed_execpolicy_amendment*/ None,
+                    /*additional_permissions*/ None,
+                    /*available_decisions*/ None,
+                    /*plugin_attribution_override*/ None,
+                )
+                .await
+            }
+            ApprovalAction::RequestPermissions { .. } => {
+                unreachable!("permission requests are routed directly to Guardian")
+            }
         }
     }
 }
@@ -650,12 +777,11 @@ fn record_resolution(ctx: &ApprovalContext, resolution: &ApprovalResolution) {
         ApprovalResolutionSource::Guardian => ToolDecisionSource::AutomatedReviewer,
         ApprovalResolutionSource::User => ToolDecisionSource::User,
     };
-    let tool_name = flat_tool_name(&ctx.tool_name);
     ctx.review_context.turn().session_telemetry.tool_decision(
-        tool_name.as_ref(),
+        &ctx.tool_name,
         &ctx.call_id,
         &resolution.decision,
-        source,
+        Some(source),
     );
 }
 

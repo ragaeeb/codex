@@ -23,6 +23,7 @@ use codex_tools::ToolSpec;
 pub struct TestSyncHandler;
 
 const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+const GIT_ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 static BARRIERS: OnceLock<tokio::sync::Mutex<HashMap<String, BarrierState>>> = OnceLock::new();
 
@@ -42,11 +43,15 @@ struct BarrierArgs {
 #[derive(Debug, Deserialize)]
 struct TestSyncArgs {
     #[serde(default)]
+    output_json_rows: Option<usize>,
+    #[serde(default)]
     sleep_before_ms: Option<u64>,
     #[serde(default)]
     sleep_after_ms: Option<u64>,
     #[serde(default)]
     barrier: Option<BarrierArgs>,
+    #[serde(default)]
+    wait_for_git_enrichment: bool,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -80,7 +85,7 @@ impl TestSyncHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation { payload, turn, .. } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -103,14 +108,37 @@ impl TestSyncHandler {
             wait_on_barrier(barrier).await?;
         }
 
+        if args.wait_for_git_enrichment {
+            tokio::time::timeout(
+                GIT_ENRICHMENT_TIMEOUT,
+                turn.turn_metadata_state.wait_for_git_enrichment(),
+            )
+            .await
+            .map_err(|_| {
+                FunctionCallError::RespondToModel(format!(
+                    "test_sync_tool git enrichment wait timed out after {} seconds",
+                    GIT_ENRICHMENT_TIMEOUT.as_secs()
+                ))
+            })?;
+        }
+
         if let Some(delay) = args.sleep_after_ms
             && delay > 0
         {
             sleep(Duration::from_millis(delay)).await;
         }
 
+        let output = match args.output_json_rows {
+            Some(rows) => serde_json::to_string_pretty(&serde_json::json!({
+                "rows": (0..rows)
+                    .map(|index| format!("row-{index:04}-middle-marker"))
+                    .collect::<Vec<_>>()
+            }))
+            .unwrap_or_default(),
+            None => "ok".to_string(),
+        };
         Ok(boxed_tool_output(FunctionToolOutput::from_text(
-            "ok".to_string(),
+            output,
             Some(true),
         )))
     }

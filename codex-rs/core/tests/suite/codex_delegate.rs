@@ -1,3 +1,4 @@
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
@@ -8,6 +9,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathExt;
@@ -280,7 +282,7 @@ async fn codex_delegate_rejects_skill_mcp_dependency_installation_without_prompt
             let agents_dir = skill_dir.join("agents");
             fs.create_directory(
                 &PathUri::from_host_native_path(&agents_dir)?,
-                CreateDirectoryOptions { recursive: true },
+                CreateDirectoryOptions { recursive: true, follow_symlinks: true },
                 /*sandbox*/ None,
             )
             .await?;
@@ -288,14 +290,14 @@ async fn codex_delegate_rejects_skill_mcp_dependency_installation_without_prompt
                 &PathUri::from_host_native_path(skill_dir.join("SKILL.md"))?,
                 b"---\nname: dependency-skill\ndescription: Requires an MCP server.\n---\n\nReview dependency instructions.\n"
                     .to_vec(),
-                /*sandbox*/ None,
+                Default::default(), /*sandbox*/ None,
             )
             .await?;
             fs.write_file(
                 &PathUri::from_host_native_path(agents_dir.join("openai.yaml"))?,
                 b"dependencies:\n  tools:\n    - type: mcp\n      value: missing-review-server\n      transport: streamable_http\n      url: http://127.0.0.1:1/mcp\n"
                     .to_vec(),
-                /*sandbox*/ None,
+                Default::default(), /*sandbox*/ None,
             )
             .await?;
             Ok(())
@@ -410,20 +412,17 @@ async fn guardian_delegate_rejects_escalation_requests_without_prompting() {
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "Trigger Guardian review of an escalated command".to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::OnRequest),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await
         .expect("submit guardian-reviewed command");
 

@@ -30,6 +30,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
+#[cfg(target_os = "windows")]
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -37,6 +39,11 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use self::execution_scope::ExecutionScope;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_MANAGED_HTTP_PROXY_PORTS: RangeInclusive<u16> = 3128..=3159;
+#[cfg(target_os = "windows")]
+const WINDOWS_MANAGED_SOCKS_PROXY_PORTS: RangeInclusive<u16> = 8081..=8112;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "codex-network-proxy", about = "Codex network sandbox proxy")]
@@ -317,49 +324,75 @@ pub(super) fn reserve_windows_managed_listeners(
 ) -> Result<ReservedListenerSet> {
     let http_addr = windows_managed_loopback_addr(http_addr);
     let socks_addr = windows_managed_loopback_addr(socks_addr);
-
-    match try_reserve_windows_managed_listeners(http_addr, socks_addr, reserve_socks_listener) {
-        Ok(listeners) => Ok(listeners),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            warn!("managed Windows proxy ports are busy; falling back to ephemeral loopback ports");
-            reserve_loopback_ephemeral_listeners(reserve_socks_listener)
-                .context("reserve fallback loopback proxy listeners")
-        }
-        Err(err) => Err(err).context("reserve Windows managed proxy listeners"),
-    }
+    let http_listener =
+        reserve_windows_managed_listener(http_addr, WINDOWS_MANAGED_HTTP_PROXY_PORTS, "HTTP")?;
+    let socks_listener = if reserve_socks_listener {
+        Some(reserve_windows_managed_listener(
+            socks_addr,
+            WINDOWS_MANAGED_SOCKS_PROXY_PORTS,
+            "SOCKS5",
+        )?)
+    } else {
+        None
+    };
+    Ok(ReservedListenerSet::new(http_listener, socks_listener))
 }
 
 #[cfg(target_os = "windows")]
 pub(super) fn reserve_windows_managed_socks_listener(
     socks_addr: SocketAddr,
 ) -> Result<StdTcpListener> {
-    let socks_addr = windows_managed_loopback_addr(socks_addr);
-    match StdTcpListener::bind(socks_addr) {
-        Ok(listener) => Ok(listener),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            warn!(
-                "managed Windows SOCKS5 proxy port is busy; falling back to an ephemeral loopback port"
-            );
-            reserve_loopback_ephemeral_listener()
-                .context("reserve fallback loopback SOCKS5 proxy listener")
-        }
-        Err(err) => Err(err).context("reserve Windows managed SOCKS5 proxy listener"),
-    }
+    reserve_windows_managed_listener(
+        windows_managed_loopback_addr(socks_addr),
+        WINDOWS_MANAGED_SOCKS_PROXY_PORTS,
+        "SOCKS5",
+    )
 }
 
 #[cfg(target_os = "windows")]
-fn try_reserve_windows_managed_listeners(
-    http_addr: SocketAddr,
-    socks_addr: SocketAddr,
-    reserve_socks_listener: bool,
-) -> std::io::Result<ReservedListenerSet> {
-    let http_listener = StdTcpListener::bind(http_addr)?;
-    let socks_listener = if reserve_socks_listener {
-        Some(StdTcpListener::bind(socks_addr)?)
-    } else {
-        None
-    };
-    Ok(ReservedListenerSet::new(http_listener, socks_listener))
+fn reserve_windows_managed_listener(
+    requested_addr: SocketAddr,
+    ports: RangeInclusive<u16>,
+    protocol: &str,
+) -> Result<StdTcpListener> {
+    let requested_port = requested_addr.port();
+    anyhow::ensure!(
+        requested_port != 0,
+        "managed Windows {protocol} proxy must use a fixed non-zero port"
+    );
+    let start = *ports.start();
+    let end = *ports.end();
+
+    for port in std::iter::once(requested_port).chain(ports.filter(|port| *port != requested_port))
+    {
+        let addr = SocketAddr::new(requested_addr.ip(), port);
+        match StdTcpListener::bind(addr) {
+            Ok(listener) => {
+                if port != requested_port {
+                    warn!(
+                        "managed Windows {protocol} proxy port {requested_port} is unavailable; using bounded fallback port {port}"
+                    );
+                }
+                return Ok(listener);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("reserve managed Windows {protocol} proxy listener on {addr}")
+                });
+            }
+        }
+    }
+
+    warn!(
+        "managed Windows {protocol} proxy port {requested_port} and preferred ports {start}-{end} are unavailable; falling back to an ephemeral loopback port"
+    );
+    reserve_loopback_ephemeral_listener()
+        .with_context(|| format!("reserve fallback loopback Windows {protocol} proxy listener"))
 }
 
 #[cfg(target_os = "windows")]
@@ -834,6 +867,7 @@ impl NetworkProxy {
     pub async fn remote_launch_config(&self) -> Result<crate::RemoteNetworkProxyLaunchConfig> {
         let (mut config, brokerage_created_default_allowlist) =
             self.state.current_cfg_with_brokerage_provenance().await?;
+        // Proxy enablement and credential brokerage remain controller-owned.
         let mut broker_only_config = config::NetworkProxyConfig {
             enabled: config.enabled,
             credential_broker_openai_host: config.credential_broker_openai_host.clone(),
@@ -844,6 +878,14 @@ impl NetworkProxy {
         broker_only_config.set_credential_broker_enabled(/*enabled*/ true);
         broker_only_config.set_allowed_domains(vec!["*".to_string()]);
         let broker_only = brokerage_created_default_allowlist && config == broker_only_config;
+
+        let environment_policy = self
+            .execution_scope
+            .as_ref()
+            .and_then(|scope| scope.environment_policy.as_ref());
+        if let Some(policy) = environment_policy {
+            policy.apply_to(&mut config);
+        }
         if config.credential_broker {
             config.enabled &= !broker_only;
             config.credential_broker = false;
@@ -852,6 +894,10 @@ impl NetworkProxy {
                 config.mitm = false;
             }
         }
+        anyhow::ensure!(
+            environment_policy.is_none() || config.enabled,
+            "environment network policy requires an enabled executor proxy"
+        );
         let proxy = crate::RemoteNetworkProxyConfig::from_effective_config(&config)?;
         let (environment_id, execution_id) = self
             .execution_scope
@@ -880,6 +926,7 @@ impl NetworkProxy {
         let state = Arc::clone(&self.state);
         let environment_id = scope.environment_id.clone();
         let execution_id = scope.execution_id.clone();
+        let environment_policy_applies = scope.environment_policy.is_some();
         let execution_lifetime = scope.lifetime_tx.subscribe();
         Some(Arc::new(move |mut request: crate::NetworkPolicyRequest| {
             let decider = Arc::clone(&decider);
@@ -895,8 +942,12 @@ impl NetworkProxy {
                     }
                     decision = async {
                         match state.host_blocked(&request.host, request.port).await {
-                            Ok(HostBlockDecision::Allowed) => NetworkDecision::Allow,
-                            Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed)) => {
+                            // Controller approval alone cannot bypass attachment policy.
+                            Ok(HostBlockDecision::Allowed) if !environment_policy_applies => {
+                                NetworkDecision::Allow
+                            }
+                            Ok(HostBlockDecision::Allowed)
+                            | Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed)) => {
                                 decider.decide(request).await
                             }
                             Ok(HostBlockDecision::Blocked(reason)) => {
@@ -1056,6 +1107,15 @@ impl NetworkProxy {
         command: &mut [String],
     ) {
         self.state.restore_child_credentials(env, command);
+    }
+
+    /// Replaces allowed credentials and removes credentials excluded from the environment.
+    pub fn virtualize_brokered_text(
+        &self,
+        text: &mut String,
+        env: &HashMap<String, String>,
+    ) -> bool {
+        self.state.virtualize_brokered_text(text, env)
     }
 
     pub fn apply_to_env_for_environment(
@@ -1677,13 +1737,15 @@ mod tests {
     async fn remote_policy_decider_rechecks_live_policy_and_restores_attribution() -> Result<()> {
         let captured = Arc::new(Mutex::new(None));
         let captured_request = Arc::clone(&captured);
-        let config = NetworkProxyConfig {
+        let mut config = NetworkProxyConfig {
             allow_local_binding: true,
             ..NetworkProxyConfig::default()
         };
-        let proxy = NetworkProxy::builder()
-            .state(Arc::new(network_proxy_state_for_policy(config)))
-            .policy_decider(move |request: crate::NetworkPolicyRequest| {
+        config.set_allowed_domains(vec!["controller.example".to_string()]);
+        let mut owner_config = NetworkProxyConfig::default();
+        owner_config.set_allowed_domains(vec!["owner.example".to_string()]);
+        let fallback_policy_decider: Arc<dyn NetworkPolicyDecider> =
+            Arc::new(move |request: crate::NetworkPolicyRequest| {
                 let captured = Arc::clone(&captured_request);
                 async move {
                     *captured
@@ -1692,15 +1754,26 @@ mod tests {
                         Some((request.host, request.environment_id, request.execution_id));
                     crate::NetworkDecision::Allow
                 }
-            })
+            });
+        let proxy = NetworkProxy::builder()
+            .state(Arc::new(network_proxy_state_for_policy(config)))
             .managed_by_codex(/*managed_by_codex*/ false)
             .build()
             .await?;
-        let scoped = proxy.for_execution("remote", "execution-1", "token-1".to_string())?;
+        let scoped = proxy.for_execution(
+            "remote",
+            "execution-1",
+            "token-1".to_string(),
+            Some(crate::EnvironmentNetworkPolicy::from_config(
+                &owner_config,
+                /*managed_allowed_domains_only*/ false,
+            )),
+            Some(Arc::clone(&fallback_policy_decider)),
+        )?;
         let decider = scoped
             .remote_policy_decider()
             .expect("execution-scoped proxy should expose its policy decider");
-        let mut request = https_request("allowed.example");
+        let mut request = https_request("controller.example");
         request.environment_id = Some("forged-environment".to_string());
         request.execution_id = Some("forged-execution".to_string());
 
@@ -1710,7 +1783,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some((
-                "allowed.example".to_string(),
+                "controller.example".to_string(),
                 Some("remote".to_string()),
                 Some("execution-1".to_string())
             ))
@@ -1729,11 +1802,28 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some((
-                "allowed.example".to_string(),
+                "controller.example".to_string(),
                 Some("remote".to_string()),
                 Some("execution-1".to_string())
             ))
         );
+
+        owner_config.set_denied_domains(vec!["denied.example".to_string()]);
+        assert_eq!(
+            scoped.remote_launch_config().await?.proxy.domains,
+            owner_config.domains
+        );
+        let strict_scoped = proxy.for_execution(
+            "owner-environment",
+            "execution-3",
+            "token-3".to_string(),
+            Some(crate::EnvironmentNetworkPolicy::from_config(
+                &owner_config,
+                /*managed_allowed_domains_only*/ true,
+            )),
+            Some(fallback_policy_decider),
+        )?;
+        assert!(strict_scoped.remote_policy_decider().is_none());
         Ok(())
     }
 
@@ -1757,7 +1847,13 @@ mod tests {
             .managed_by_codex(/*managed_by_codex*/ false)
             .build()
             .await?;
-        let scoped = proxy.for_execution("remote", "execution-1", "token-1".to_string())?;
+        let scoped = proxy.for_execution(
+            "remote",
+            "execution-1",
+            "token-1".to_string(),
+            /*environment_policy*/ None,
+            /*fallback_policy_decider*/ None,
+        )?;
         let decider = scoped
             .remote_policy_decider()
             .expect("execution-scoped proxy should expose its policy decider");
@@ -2019,7 +2115,13 @@ mod tests {
             }
         };
 
-        let scoped = proxy.for_execution("remote-env", "execution-1", "token-1".to_string())?;
+        let scoped = proxy.for_execution(
+            "remote-env",
+            "execution-1",
+            "token-1".to_string(),
+            /*environment_policy*/ None,
+            /*fallback_policy_decider*/ None,
+        )?;
         let launch = scoped.remote_launch_config().await?;
         let prepared = scoped.prepare_for_optional_environment(
             HashMap::from([(
@@ -2032,6 +2134,20 @@ mod tests {
         assert_eq!(launch.environment_id.as_deref(), Some("remote-env"));
         assert_eq!(launch.execution_id.as_deref(), Some("execution-1"));
         assert!(!launch.proxy.enabled);
+
+        let mut owner_config = NetworkProxyConfig::default();
+        owner_config.set_allowed_domains(vec!["owner.example".to_string()]);
+        let owner_scoped = proxy.for_execution(
+            "remote-env",
+            "execution-2",
+            "token-2".to_string(),
+            Some(crate::EnvironmentNetworkPolicy::from_config(
+                &owner_config,
+                /*managed_allowed_domains_only*/ false,
+            )),
+            /*fallback_policy_decider*/ None,
+        )?;
+        assert!(owner_scoped.remote_launch_config().await.is_err());
         for (enabled, mode, allowed_domain, proxy_url) in [
             (false, config::NetworkMode::Full, Some("*"), None),
             (false, config::NetworkMode::Full, Some("example.com"), None),
@@ -2167,6 +2283,7 @@ mod tests {
             assert_eq!(socks_proxy.http_addr(), proxy.http_addr());
             assert!(actual_socks_addr.ip().is_loopback());
             assert_ne!(actual_socks_addr, requested_socks_addr);
+            assert!(WINDOWS_MANAGED_SOCKS_PROXY_PORTS.contains(&actual_socks_addr.port()));
             assert_eq!(proxy.socks_addr(), actual_socks_addr);
             let socks_handle = socks_proxy
                 .run()
@@ -2279,10 +2396,53 @@ mod tests {
                 .ip()
                 .is_loopback()
         );
-        assert_ne!(
-            reserved.http_listener.local_addr().unwrap().port(),
-            busy_port
+        let fallback_port = reserved.http_listener.local_addr().unwrap().port();
+        assert_ne!(fallback_port, busy_port);
+        assert!(WINDOWS_MANAGED_HTTP_PROXY_PORTS.contains(&fallback_port));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reserve_windows_managed_listeners_preserves_http_when_socks_port_is_busy() {
+        let http_listener = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        drop(http_listener);
+        let occupied_socks = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+
+        let reserved = reserve_windows_managed_listeners(
+            http_addr,
+            occupied_socks.local_addr().unwrap(),
+            /*reserve_socks_listener*/ true,
+        )
+        .unwrap();
+
+        assert_eq!(reserved.http_listener.local_addr().unwrap(), http_addr);
+        assert!(
+            WINDOWS_MANAGED_SOCKS_PROXY_PORTS.contains(
+                &reserved
+                    .socks_listener
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port()
+            )
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reserve_windows_managed_listener_uses_ephemeral_port_when_preferred_ports_are_busy() {
+        let occupied = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let occupied_port = occupied_addr.port();
+
+        let listener =
+            reserve_windows_managed_listener(occupied_addr, occupied_port..=occupied_port, "HTTP")
+                .unwrap();
+
+        let fallback_addr = listener.local_addr().unwrap();
+        assert!(fallback_addr.ip().is_loopback());
+        assert_ne!(fallback_addr.port(), occupied_port);
     }
 
     #[test]

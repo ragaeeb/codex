@@ -3,6 +3,7 @@ use anyhow::Result;
 use codex_config::permissions_toml::FilesystemPermissionToml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::types::ApprovalsReviewer;
+use codex_core::TurnInputRequest;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -39,7 +40,7 @@ use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
-use core_test_support::zsh_fork::build_unified_exec_zsh_fork_test;
+use core_test_support::zsh_fork::build_zsh_fork_test;
 use core_test_support::zsh_fork::restrictive_workspace_write_profile;
 use core_test_support::zsh_fork::zsh_fork_runtime;
 use pretty_assertions::assert_eq;
@@ -618,7 +619,7 @@ where
     };
 
     let server = start_mock_server().await;
-    let test = build_unified_exec_zsh_fork_test(
+    let test = build_zsh_fork_test(
         &server,
         runtime,
         approval_policy,
@@ -740,15 +741,12 @@ async fn submit_turn_with_session_permissions(
         test.cwd.path(),
     );
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(approvals_reviewer),
@@ -763,8 +761,8 @@ async fn submit_turn_with_session_permissions(
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     Ok(())
