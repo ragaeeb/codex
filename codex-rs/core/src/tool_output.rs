@@ -15,11 +15,14 @@ use serde_json::Value;
 use serde_json::json;
 use tracing::warn;
 
+mod artifact_control_ids;
 mod content_items;
 mod event;
 mod inheritance;
 mod retention;
 
+pub(crate) use artifact_control_ids::canonicalize_legacy_artifact_controls;
+pub(crate) use artifact_control_ids::provider_call_ids_within_limit;
 pub(crate) use inheritance::artifact_controls_for_compaction;
 pub(crate) use inheritance::attach_artifact_reference_sidecar;
 pub(crate) use inheritance::has_recoverable_output_artifact;

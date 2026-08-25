@@ -220,6 +220,20 @@ fn compaction_artifact_controls_are_bounded_and_replace_large_call_arguments() {
 
     let controls = artifact_controls_for_compaction(&history);
     assert!(controls.len() <= 64);
+    for pair in controls.chunks_exact(2) {
+        let ResponseItem::FunctionCall { call_id, .. } = &pair[0].item else {
+            panic!("expected synthetic function call");
+        };
+        let ResponseItem::FunctionCallOutput {
+            call_id: output_call_id,
+            ..
+        } = &pair[1].item
+        else {
+            panic!("expected synthetic function output");
+        };
+        assert!(call_id.len() <= 64);
+        assert_eq!(output_call_id.as_deref(), Some(call_id.as_str()));
+    }
     let serialized_bytes = controls
         .iter()
         .map(|item| {

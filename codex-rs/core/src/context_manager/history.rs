@@ -332,6 +332,8 @@ impl ContextManager {
     }
 
     pub(crate) fn replace_annotated(&mut self, items: Vec<ResponseItemEnvelope>) {
+        let mut items = items;
+        crate::tool_output::canonicalize_legacy_artifact_controls(&mut items);
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;

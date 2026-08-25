@@ -1,3 +1,6 @@
+use super::artifact_control_ids::SyntheticArtifactCallIdAllocator;
+use super::artifact_control_ids::synthetic_artifact_control_body;
+use super::artifact_control_ids::synthetic_retrieval_arguments;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -80,6 +83,7 @@ pub(crate) fn artifact_controls_for_compaction(
     let mut controls = Vec::new();
     let mut seen = HashSet::new();
     let mut serialized_bytes = 0usize;
+    let mut call_id_allocator = SyntheticArtifactCallIdAllocator::for_history(history);
     let call_ids = history
         .iter()
         .filter_map(|envelope| response_call_id(&envelope.item))
@@ -111,7 +115,8 @@ pub(crate) fn artifact_controls_for_compaction(
         else {
             continue;
         };
-        let Some((call, output)) = synthetic_artifact_control_pair(call, envelope, &artifact_id)
+        let Some((call, output)) =
+            synthetic_artifact_control_pair(call, envelope, &artifact_id, &mut call_id_allocator)
         else {
             continue;
         };
@@ -147,6 +152,7 @@ pub(crate) fn merge_artifact_controls(
     let mut seen = HashSet::new();
     let mut retained_controls = Vec::new();
     let mut serialized_bytes = 0usize;
+    let mut call_id_allocator = SyntheticArtifactCallIdAllocator::for_history(&history);
     let mut candidates = candidates.into_iter();
     while let Some(call) = candidates.next() {
         let Some(output) = candidates.next() else {
@@ -155,7 +161,8 @@ pub(crate) fn merge_artifact_controls(
         let Some(artifact_id) = envelope_artifact_id(&output) else {
             continue;
         };
-        let Some((call, output)) = synthetic_artifact_control_pair(&call, &output, &artifact_id)
+        let Some((call, output)) =
+            synthetic_artifact_control_pair(&call, &output, &artifact_id, &mut call_id_allocator)
         else {
             continue;
         };
@@ -284,15 +291,10 @@ fn synthetic_artifact_control_pair(
     call: &ResponseItemEnvelope,
     output: &ResponseItemEnvelope,
     artifact_id: &OutputArtifactId,
+    call_id_allocator: &mut SyntheticArtifactCallIdAllocator,
 ) -> Option<(ResponseItemEnvelope, ResponseItemEnvelope)> {
-    let call_id = format!("artifact_ref_{}", artifact_id.digest());
-    let retrieval_arguments = serde_json::json!({
-        "artifact_id": artifact_id.as_str(),
-        "mode": "bytes",
-        "offset": 0,
-        "limit": 1,
-    })
-    .to_string();
+    let call_id = call_id_allocator.next(artifact_id)?;
+    let retrieval_arguments = synthetic_retrieval_arguments(artifact_id);
     let call_item = match &call.item {
         ResponseItem::FunctionCall { .. } => ResponseItem::FunctionCall {
             id: None,
@@ -323,15 +325,7 @@ fn synthetic_artifact_control_pair(
         },
         _ => return None,
     };
-    let body = FunctionCallOutputBody::Text(
-        serde_json::json!({
-        "type": "tool_output_artifact",
-            "version": 1,
-            "artifact_id": artifact_id.as_str(),
-            "retrieval": "Use read_tool_output with artifact_id and mode bytes, lines, or search; follow next_offset or next_byte to continue.",
-        })
-        .to_string(),
-    );
+    let body = FunctionCallOutputBody::Text(synthetic_artifact_control_body(artifact_id));
     let output_item = match &output.item {
         ResponseItem::FunctionCallOutput { .. } => ResponseItem::FunctionCallOutput {
             id: None,

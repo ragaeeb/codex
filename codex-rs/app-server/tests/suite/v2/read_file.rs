@@ -435,6 +435,23 @@ async fn app_server_read_file_execution_and_resume_keep_public_history_valid() -
         .received_requests()
         .await
         .ok_or_else(|| anyhow::anyhow!("fresh read request should be captured"))?;
+    for request in requests_after_fresh_read
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+    {
+        let body = request.body_json::<Value>()?;
+        for item in body["input"].as_array().into_iter().flatten() {
+            for field in ["id", "call_id"] {
+                if let Some(identifier) = item[field].as_str() {
+                    assert!(
+                        identifier.len() <= 64,
+                        "provider-bound {field} must be <=64 bytes, got {}",
+                        identifier.len()
+                    );
+                }
+            }
+        }
+    }
     let fresh_read_output =
         function_call_output(&requests_after_fresh_read, "read-file-call-after-reopen")?;
     assert_eq!(

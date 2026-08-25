@@ -454,6 +454,15 @@ fn assert_compact_request_omits_harness_metadata(request: &responses::ResponsesR
             item.get("metadata").is_none() && item.get("replacement_history_metadata").is_none(),
             "provider request must not receive harness history metadata: {item}"
         );
+        for field in ["id", "call_id"] {
+            if let Some(identifier) = item.get(field).and_then(Value::as_str) {
+                assert!(
+                    identifier.len() <= 64,
+                    "provider-bound {field} must be <=64 bytes, got {}",
+                    identifier.len()
+                );
+            }
+        }
     }
 }
 
