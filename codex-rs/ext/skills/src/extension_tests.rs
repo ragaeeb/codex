@@ -1,6 +1,10 @@
 use std::sync::Mutex;
 
 use codex_extension_api::ExtensionMetrics;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC;
 use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC;
 use codex_otel::THREAD_SKILLS_ENABLED_TOTAL_METRIC;
 use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
@@ -56,6 +60,10 @@ fn empty_catalog_records_zero_metrics_without_a_fragment() {
                 THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC.to_string(),
                 0,
             ),
+            (THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC.to_string(), 0),
+            (THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC.to_string(), 0),
+            (THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC.to_string(), 0),
+            (THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC.to_string(), 0),
         ]
     );
 }

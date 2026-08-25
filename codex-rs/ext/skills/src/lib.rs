@@ -16,6 +16,7 @@ mod loader;
 pub mod provider;
 mod render;
 mod render_observability;
+mod render_policy;
 mod selection;
 mod shadow_selection_experiment;
 mod sources;

@@ -84,6 +84,8 @@ use pretty_assertions::assert_eq;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[path = "skills_extension/catalog_selection_tests.rs"]
+mod catalog_selection_tests;
 #[path = "skills_extension/shadow_task_context_tests.rs"]
 mod shadow_task_context_tests;
 
@@ -294,7 +296,10 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
     );
     let mut expected = expected_catalog_metric_samples("host_world_state", /*count*/ 1);
     assert!(startup_metrics.samples().is_empty());
-    assert_eq!(turn_metrics.samples(), expected);
+    assert_eq!(
+        legacy_catalog_metric_samples(turn_metrics.samples()),
+        expected
+    );
 
     let sections = registry.context_contributors()[0]
         .contribute_world_state(WorldStateContributionInput {
@@ -315,7 +320,10 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
             .is_none()
     );
     assert!(startup_metrics.samples().is_empty());
-    assert_eq!(turn_metrics.samples(), expected);
+    assert_eq!(
+        legacy_catalog_metric_samples(turn_metrics.samples()),
+        expected
+    );
 
     let second_skill_path =
         AbsolutePathBuf::try_from(test_codex_home().join("skills/other/SKILL.md"))?;
@@ -355,7 +363,10 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
         /*count*/ 2,
     ));
     assert!(startup_metrics.samples().is_empty());
-    assert_eq!(turn_metrics.samples(), expected);
+    assert_eq!(
+        legacy_catalog_metric_samples(turn_metrics.samples()),
+        expected
+    );
 
     Ok(())
 }
@@ -583,7 +594,10 @@ async fn executor_orchestrator_and_host_share_catalog_world_state_flow() -> Test
     .into_iter()
     .flat_map(|surface| expected_catalog_metric_samples(surface, /*count*/ 1))
     .collect::<Vec<_>>();
-    assert_eq!(metrics.samples(), expected_metrics);
+    assert_eq!(
+        legacy_catalog_metric_samples(metrics.samples()),
+        expected_metrics
+    );
 
     Ok(())
 }
@@ -665,7 +679,7 @@ async fn nonempty_executor_empty_host_records_catalog_metrics() -> TestResult {
             .is_none()
     );
     let expected = expected_catalog_metric_samples("executor_world_state", /*count*/ 1);
-    assert_eq!(metrics.samples(), expected);
+    assert_eq!(legacy_catalog_metric_samples(metrics.samples()), expected);
     Ok(())
 }
 
@@ -2548,6 +2562,21 @@ fn expected_catalog_metric_samples(catalog_surface: &str, count: i64) -> Vec<Rec
     ]
 }
 
+fn legacy_catalog_metric_samples(samples: Vec<RecordedHistogram>) -> Vec<RecordedHistogram> {
+    samples
+        .into_iter()
+        .filter(|sample| {
+            matches!(
+                sample.name.as_str(),
+                THREAD_SKILLS_ENABLED_TOTAL_METRIC
+                    | THREAD_SKILLS_KEPT_TOTAL_METRIC
+                    | THREAD_SKILLS_TRUNCATED_METRIC
+                    | THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC
+            )
+        })
+        .collect()
+}
+
 impl SkillProvider for StaticSkillProvider {
     fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
         let list_call = self
@@ -2607,6 +2636,7 @@ struct TestConfig {
     bundled_skills_enabled: bool,
     orchestrator_skills_enabled: bool,
     shadow_selection_enabled: bool,
+    catalog_selection_enabled: bool,
 }
 
 fn default_config() -> TestConfig {
@@ -2615,6 +2645,7 @@ fn default_config() -> TestConfig {
         bundled_skills_enabled: true,
         orchestrator_skills_enabled: true,
         shadow_selection_enabled: false,
+        catalog_selection_enabled: false,
     }
 }
 
@@ -2625,6 +2656,7 @@ fn skills_extension_config(config: &TestConfig) -> SkillsExtensionConfig {
         bundled_skills_enabled: config.bundled_skills_enabled,
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.shadow_selection_enabled,
+        catalog_selection_enabled: config.catalog_selection_enabled,
     }
 }
 

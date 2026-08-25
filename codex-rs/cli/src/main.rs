@@ -2274,6 +2274,9 @@ async fn run_debug_prompt_input_command(
             shadow_selection_enabled: config
                 .features
                 .enabled(codex_features::Feature::SkillSearch),
+            catalog_selection_enabled: config
+                .features
+                .enabled(codex_features::Feature::SkillCatalogSelection),
         }
     });
     let prompt_input = codex_core::build_prompt_input(

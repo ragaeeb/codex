@@ -15,11 +15,11 @@ use crate::provider::SkillListQuery;
 use crate::provider::attribute_executor_plugins;
 use crate::render::AvailableSkillsRender;
 use crate::render::RenderedSkillCatalogs;
-use crate::render::SkillMetadataBudget;
 use crate::render::render_combined_available_skills;
-use crate::render::skill_metadata_budget;
 use crate::render_observability::CatalogSurface;
 use crate::render_observability::record_catalog_render;
+use crate::render_policy::SkillMetadataBudget;
+use crate::render_policy::skill_metadata_budget;
 use crate::sources::SkillProviders;
 use crate::state::EmittedCatalogBudgetWarnings;
 use crate::state::ExecutorSkillsStepState;
@@ -259,6 +259,7 @@ impl<'a> CatalogContext<'a> {
                 &catalogs.host.catalog,
                 self.metadata_budget,
                 self.include_usage,
+                self.config.catalog_selection_enabled,
             )
         } else {
             RenderedSkillCatalogs::default()
@@ -293,6 +294,10 @@ impl<'a> CatalogContext<'a> {
             .as_ref()
             .map(|rendered| rendered.report.clone())
             .unwrap_or_default();
+        let size = rendered
+            .as_ref()
+            .map(|rendered| rendered.size)
+            .unwrap_or_default();
         let body = rendered
             .and_then(|rendered| rendered.into_fragment(self.include_usage))
             .map(|fragment| fragment.body());
@@ -311,6 +316,7 @@ impl<'a> CatalogContext<'a> {
                 kind.metrics_surface(),
                 metadata_budget,
                 &render_report,
+                size,
             );
             if let Some(message) = render_report.warning_message() {
                 warning_emitter(message);

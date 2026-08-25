@@ -274,6 +274,7 @@ fn catalog_extensions(
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         }
     });
     (Arc::new(extensions.build()), event_rx)
@@ -517,7 +518,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
     std::fs::write(
         &host_skill_path,
         format!(
-            "---\nname: host-search\ndescription: inspect host data\n---\n\n{HOST_SKILL_BODY}\n"
+            "---\nname: host-search\ndescription: inspect host data with verbose routing metadata\nmetadata:\n  short-description: inspect host data\n---\n\n{HOST_SKILL_BODY}\n"
         ),
     )?;
     let host_skill_path = dunce::canonicalize(host_skill_path)?;
@@ -541,7 +542,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
     )?;
     std::fs::write(
         codex_home.path().join("config.toml"),
-        "[features]\nplugins = true\n\n[plugins.\"sample@test\"]\nenabled = true\n",
+        "[features]\nplugins = true\nskill_catalog_selection = true\n\n[plugins.\"sample@test\"]\nenabled = true\n",
     )?;
 
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
@@ -551,6 +552,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
         bundled_skills_enabled: config.bundled_skills_enabled(),
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+        catalog_selection_enabled: config.features.enabled(Feature::SkillCatalogSelection),
     });
     let mut builder = test_codex()
         .with_home(Arc::clone(&codex_home))
@@ -655,6 +657,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
         developer_text.contains("host-search: inspect host data"),
         "expected host skill summary in developer message: {developer_messages:?}"
     );
+    assert!(!developer_text.contains("verbose routing metadata"));
 
     let user_text = request.message_input_texts("user").join("\n");
     for (name, path, body) in [
@@ -968,6 +971,7 @@ text({ names: result.skills.map(skill => skill.name), warnings: result.warnings,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: true,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         },
     );
     let mut builder = apps_enabled_builder(apps_server.chatgpt_base_url)
@@ -1332,6 +1336,7 @@ async fn production_turn_aliases_discovered_singleton_orchestrator_root() -> Res
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: true,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         },
     );
     let mut builder = apps_enabled_builder(apps_server.chatgpt_base_url)
@@ -1992,6 +1997,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: true,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         },
     );
     let mut builder = test_codex()
@@ -2093,6 +2099,7 @@ async fn production_turn_scales_extension_catalog_from_resolved_model_window() -
                 bundled_skills_enabled: false,
                 orchestrator_skills_enabled: false,
                 shadow_selection_enabled: false,
+                catalog_selection_enabled: false,
             },
         );
         let mut builder = test_codex()
@@ -2413,6 +2420,7 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         },
     );
     let mut builder = apps_enabled_builder(apps_server.chatgpt_base_url)
@@ -2514,6 +2522,7 @@ async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> R
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         },
     );
     let mut builder = test_codex()
@@ -2769,6 +2778,7 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: config.orchestrator_skills_enabled,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         },
     );
     let mut builder = test_codex()
@@ -3035,6 +3045,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
+            catalog_selection_enabled: false,
         },
     );
     let mut builder = test_codex()

@@ -13,4 +13,6 @@ pub struct SkillsExtensionConfig {
     pub orchestrator_skills_enabled: bool,
     /// Whether cheap skill selectors run in shadow mode without changing prompt contents.
     pub shadow_selection_enabled: bool,
+    /// Whether model-visible skill metadata uses stable compact rendering.
+    pub catalog_selection_enabled: bool,
 }

@@ -129,6 +129,9 @@ where
             shadow_selection_enabled: config
                 .features
                 .enabled(codex_features::Feature::SkillSearch),
+            catalog_selection_enabled: config
+                .features
+                .enabled(codex_features::Feature::SkillCatalogSelection),
         },
     );
     Arc::new(builder.build())

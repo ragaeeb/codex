@@ -94,6 +94,9 @@ impl MessageProcessor {
                 shadow_selection_enabled: config
                     .features
                     .enabled(codex_features::Feature::SkillSearch),
+                catalog_selection_enabled: config
+                    .features
+                    .enabled(codex_features::Feature::SkillCatalogSelection),
             },
         );
         let thread_manager = Arc::new(ThreadManager::new(

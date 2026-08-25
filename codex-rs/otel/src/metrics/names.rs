@@ -65,3 +65,12 @@ pub const THREAD_SKILLS_KEPT_TOTAL_METRIC: &str = "codex.thread.skills.kept_tota
 pub const THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC: &str =
     "codex.thread.skills.description_truncated_chars";
 pub const THREAD_SKILLS_TRUNCATED_METRIC: &str = "codex.thread.skills.truncated";
+pub const THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC: &str = "codex.thread.skills.catalog_full_bytes";
+pub const THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC: &str =
+    "codex.thread.skills.catalog_rendered_bytes";
+pub const THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC: &str =
+    "codex.thread.skills.catalog_full_tokens";
+pub const THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC: &str =
+    "codex.thread.skills.catalog_rendered_tokens";
+pub const THREAD_SKILLS_CATALOG_RENDER_OUTCOME_METRIC: &str =
+    "codex.thread.skills.catalog_render_outcome";

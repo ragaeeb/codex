@@ -4,6 +4,7 @@ const SKILLS_INTRO_WITH_SOURCE_LOCATORS: &str = "A skill is a set of instruction
 const SKILLS_INTRO_WITH_HOST_ALIASES: &str = "A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a short path that can be expanded into an absolute path using the skill roots table.";
 const SKILLS_INTRO_WITH_RESOURCE_ALIASES: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. Short locators can be expanded using the skill roots table.";
 const RESOURCE_ALIAS_INSTRUCTIONS: &str = "- Root aliases: Pass short package locators directly to `skills.read`; it resolves their matching alias from `### Skill roots`.";
+const PACKAGE_READ_INSTRUCTIONS: &str = "Read a skill package directly with `skills.read({\"package\":\"<package>\"})` to read its `SKILL.md`; root aliases are resolved automatically. To read another file from that skill, use the same `package` and pass the file's complete `skill://` identifier as `resource`. If the package is not provided, use `skills.list` to find it.";
 const SKILLS_HOW_TO_USE_WITH_SOURCE_LOCATORS: &str = r###"- Discovery: The list above is the skills available in this session (name + description + source locator). `file` entries live on the host filesystem, `executor package` and `orchestrator package` entries are accessed directly through `skills.read`, and `custom resource` entries use their provider's access mechanism.
 - Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
 - Missing/blocked: If a named skill isn't in the list or its source can't be read, say so briefly and continue with the best fallback.
@@ -93,13 +94,53 @@ pub(crate) fn render_available_skills_body(
     if skill_lines.iter().any(|line| {
         line.contains("(executor package: ") || line.contains("(orchestrator package: ")
     }) {
-        lines.push(
-            "Read a skill package directly with `skills.read({\"package\":\"<package>\"})` to read its `SKILL.md`; root aliases are resolved automatically. To read another file from that skill, use the same `package` and pass the file's complete `skill://` identifier as `resource`. If the package is not provided, use `skills.list` to find it."
-                .to_string(),
-        );
+        lines.push(PACKAGE_READ_INSTRUCTIONS.to_string());
     }
     lines.push("### Available skills".to_string());
     lines.extend(skill_lines.iter().cloned());
 
     format!("\n{}\n", lines.join("\n"))
+}
+
+pub(crate) fn available_skills_body_bytes(
+    prompt_kind: SkillPromptKind,
+    skill_root_lines: &[String],
+    skill_lines: &[String],
+    include_skills_usage_instructions: bool,
+) -> usize {
+    let mut line_count = 0usize;
+    let mut bytes = 0usize;
+    let mut add_line = |line: &str| {
+        bytes = bytes.saturating_add(line.len());
+        line_count = line_count.saturating_add(1);
+    };
+
+    add_line("## Skills");
+    add_line(prompt_kind.intro());
+    if !skill_root_lines.is_empty() {
+        add_line("### Skill roots");
+        for line in skill_root_lines {
+            add_line(line);
+        }
+    }
+    if skill_lines.iter().any(|line| {
+        line.contains("(executor package: ") || line.contains("(orchestrator package: ")
+    }) {
+        add_line(PACKAGE_READ_INSTRUCTIONS);
+    }
+    add_line("### Available skills");
+    for line in skill_lines {
+        add_line(line);
+    }
+    if include_skills_usage_instructions {
+        add_line("### How to use skills");
+        if let Some(instructions) = prompt_kind.alias_instructions() {
+            add_line(instructions);
+        }
+        add_line(prompt_kind.usage_instructions());
+    }
+
+    bytes
+        .saturating_add(line_count.saturating_sub(1))
+        .saturating_add(2)
 }

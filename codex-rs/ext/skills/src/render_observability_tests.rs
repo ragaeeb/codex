@@ -1,9 +1,15 @@
 use std::sync::Mutex;
 
 use codex_extension_api::ExtensionMetrics;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDER_OUTCOME_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC;
+use codex_otel::THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC;
 use pretty_assertions::assert_eq;
 
 use super::*;
+use crate::render_policy::SkillCatalogRenderOutcome;
 
 #[derive(Debug, Eq, PartialEq)]
 struct RecordedHistogram {
@@ -53,6 +59,13 @@ fn records_core_equivalent_catalog_render_metrics_with_surface() {
         CatalogSurface::TurnInput,
         SkillMetadataBudget::Tokens(400),
         &report,
+        SkillRenderSize {
+            full_body_bytes: 2_000,
+            rendered_body_bytes: 1_200,
+            full_body_tokens: 500,
+            rendered_body_tokens: 300,
+            outcome: Some(SkillCatalogRenderOutcome::Compact),
+        },
     );
 
     assert_eq!(
@@ -80,6 +93,34 @@ fn records_core_equivalent_catalog_render_metrics_with_surface() {
                 name: THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC.to_string(),
                 value: 700,
                 tags: vec![("catalog_surface".to_string(), "turn_input".to_string())],
+            },
+            RecordedHistogram {
+                name: THREAD_SKILLS_CATALOG_FULL_BYTES_METRIC.to_string(),
+                value: 2_000,
+                tags: vec![("catalog_surface".to_string(), "turn_input".to_string())],
+            },
+            RecordedHistogram {
+                name: THREAD_SKILLS_CATALOG_RENDERED_BYTES_METRIC.to_string(),
+                value: 1_200,
+                tags: vec![("catalog_surface".to_string(), "turn_input".to_string())],
+            },
+            RecordedHistogram {
+                name: THREAD_SKILLS_CATALOG_FULL_TOKENS_METRIC.to_string(),
+                value: 500,
+                tags: vec![("catalog_surface".to_string(), "turn_input".to_string())],
+            },
+            RecordedHistogram {
+                name: THREAD_SKILLS_CATALOG_RENDERED_TOKENS_METRIC.to_string(),
+                value: 300,
+                tags: vec![("catalog_surface".to_string(), "turn_input".to_string())],
+            },
+            RecordedHistogram {
+                name: THREAD_SKILLS_CATALOG_RENDER_OUTCOME_METRIC.to_string(),
+                value: 1,
+                tags: vec![
+                    ("catalog_surface".to_string(), "turn_input".to_string()),
+                    ("render_outcome".to_string(), "compact".to_string()),
+                ],
             },
         ]
     );

@@ -895,6 +895,9 @@
             "shell_zsh_fork": {
               "type": "boolean"
             },
+            "skill_catalog_selection": {
+              "type": "boolean"
+            },
             "skill_env_var_dependency_prompt": {
               "type": "boolean"
             },
@@ -930,6 +933,9 @@
             },
             "token_budget": {
               "$ref": "#/definitions/FeatureToml_for_TokenBudgetConfigToml"
+            },
+            "tool_argument_repair": {
+              "type": "boolean"
             },
             "tool_call_mcp_elicitation": {
               "type": "boolean"
@@ -5920,6 +5926,9 @@
         "shell_zsh_fork": {
           "type": "boolean"
         },
+        "skill_catalog_selection": {
+          "type": "boolean"
+        },
         "skill_env_var_dependency_prompt": {
           "type": "boolean"
         },
@@ -5955,6 +5964,9 @@
         },
         "token_budget": {
           "$ref": "#/definitions/FeatureToml_for_TokenBudgetConfigToml"
+        },
+        "tool_argument_repair": {
+          "type": "boolean"
         },
         "tool_call_mcp_elicitation": {
           "type": "boolean"

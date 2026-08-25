@@ -1,5 +1,6 @@
 // This shadow-selection experiment is temporary and should be removed after evaluation.
 
+mod authority_coverage;
 mod task_context;
 
 pub(crate) use task_context::ShadowTaskContext;
@@ -123,6 +124,12 @@ impl ShadowSelectionExperiment {
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
+        authority_coverage::record_authority_coverage(
+            self.metrics_client.as_ref(),
+            catalog,
+            &eligible_ids,
+            query_script,
+        );
         let recent_skill_ids = recent_skill_invocations
             .snapshot()
             .iter()

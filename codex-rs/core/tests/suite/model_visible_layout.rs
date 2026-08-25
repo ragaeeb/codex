@@ -82,6 +82,7 @@ fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
         bundled_skills_enabled: config.bundled_skills_enabled(),
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+        catalog_selection_enabled: config.features.enabled(Feature::SkillCatalogSelection),
     });
     Arc::new(extensions.build())
 }

@@ -49,15 +49,16 @@ use crate::provider::SkillReadRequest;
 use crate::render::AvailableSkillsRender;
 use crate::render::MAX_SKILL_NAME_BYTES;
 use crate::render::MAX_SKILL_PATH_BYTES;
-use crate::render::SkillCatalogRenderPolicy;
-use crate::render::SkillMetadataBudget;
-use crate::render::SkillRenderReport;
 use crate::render::render_available_skills;
-use crate::render::skill_metadata_budget;
 use crate::render::truncate_main_prompt_contents;
 use crate::render::truncate_utf8_to_bytes;
 use crate::render_observability::CatalogSurface;
 use crate::render_observability::record_catalog_render;
+use crate::render_policy::SkillCatalogRenderPolicy;
+use crate::render_policy::SkillMetadataBudget;
+use crate::render_policy::SkillRenderReport;
+use crate::render_policy::catalog_render_policy;
+use crate::render_policy::skill_metadata_budget;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::shadow_selection_experiment::ShadowSelectionExperiment;
 use crate::sources::SkillProviders;
@@ -118,10 +119,17 @@ fn render_prepared_catalog(
             catalog_surface,
             budget,
             &SkillRenderReport::default(),
+            Default::default(),
         );
         return RenderedCatalog::default();
     };
-    record_catalog_render(extension_metrics, catalog_surface, budget, &rendered.report);
+    record_catalog_render(
+        extension_metrics,
+        catalog_surface,
+        budget,
+        &rendered.report,
+        rendered.size,
+    );
     let warning_message = rendered.report.warning_message();
     let fragment = rendered.into_fragment(include_skills_usage_instructions);
     RenderedCatalog {
@@ -229,7 +237,7 @@ where
                 CatalogSurface::ThreadContext,
                 &catalog,
                 include_usage,
-                SkillCatalogRenderPolicy::ExtensionCompatible,
+                catalog_render_policy(config.catalog_selection_enabled),
                 skill_metadata_budget(/*context_window*/ None, config.max_context_tokens),
             );
             if let Some(message) = rendered.warning_message {
@@ -438,7 +446,7 @@ where
                     CatalogSurface::TurnInput,
                     &turn_catalog,
                     include_usage,
-                    SkillCatalogRenderPolicy::ExtensionCompatible,
+                    catalog_render_policy(config.catalog_selection_enabled),
                     metadata_budget,
                 );
                 if let Some(message) = rendered.warning_message {
